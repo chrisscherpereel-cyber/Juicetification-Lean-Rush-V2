@@ -3,7 +3,7 @@ pandas>=1.5
 matplotlib>=3.6
 streamlit-sortables>=0.3
 
-# Optional — only needed when per-student persistence (student_store) is
-# configured with storage secrets. The app runs fully without these.
-# cryptography>=41
-# dropbox>=11
+# Required for per-student persistence (student_store) once storage secrets are
+# configured. Harmless if storage is left unconfigured (imported lazily).
+cryptography>=41
+dropbox>=11

@@ -205,8 +205,9 @@ deployment actually detects the storage secrets (presence only, never values).
 
 Only game logic-free progress state is stored — decisions, round, history,
 reflections and coach state — as plain JSON; figures, RNGs and transient
-simulation objects are never persisted. The optional `cryptography` and `dropbox`
-packages (commented in `requirements.txt`) are only needed once storage is on.
+simulation objects are never persisted. Persistence requires the `cryptography`
+and `dropbox` packages (listed in `requirements.txt`); they are imported lazily,
+so a deployment that leaves storage unconfigured still runs without using them.
 
 ---
 
