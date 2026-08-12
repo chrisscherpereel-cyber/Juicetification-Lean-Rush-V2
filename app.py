@@ -813,23 +813,51 @@ st.set_page_config(page_title="Juicetification: The Lean Rush", page_icon="🥤"
 from manifest import MANIFEST
 from juice_director import serve_manifest_if_requested, resolve_config
 serve_manifest_if_requested(MANIFEST)
-CFG, CTX = resolve_config(MANIFEST)
+# `?game=<code>` links pull the instructor's saved configuration straight from
+# storage (the same Dropbox the Director writes to); `?cfg=` still works too.
+CFG, CTX = resolve_config(MANIFEST, fetch=store.load_game_config)
 # apply the instructor's economics / rush overrides to the engine constants
 HORIZON_S = CFG["horizon_s"]
 BLEND_SETUP = CFG["blend_setup"]
 HANDOFF_TIME = CFG["handoff_time"]
 
 # ---- per-student persistence (student_store): identity + resume gate ---------
-# When storage is unconfigured, store.enabled() is False and every store call is
-# a safe no-op, so the app behaves exactly as before (no gate, random seed).
 game = store.game_code()          # ?game= code (or None)
 sid = store.get_student_id()      # ?sid= student id (or None)
-if store.enabled() and not sid:
+
+# Storage self-check: open the app with ?diag=1 to see whether THIS deployment
+# actually detects the storage secrets (values are never shown, only presence).
+if st.query_params.get("diag"):
+    st.title("🔧 Storage diagnostic")
+    st.write({
+        "storage enabled": store.enabled(),
+        "game code (?game=)": game,
+        "student id (?sid=)": sid,
+        "DB_ENCRYPTION_KEY present": bool(store.DB_ENCRYPTION_KEY),
+        "DROPBOX_ACCESS_TOKEN present": bool(store._ACCESS),
+        "DROPBOX_REFRESH_TOKEN present": bool(store._REFRESH),
+        "DROPBOX_APP_KEY present": bool(store._APP_KEY),
+        "DROPBOX_APP_SECRET present": bool(store._APP_SECRET),
+        "PROGRESS_ROOT": store.PROGRESS_ROOT,
+    })
+    st.info("`storage enabled` must be true for logins to persist. It requires "
+            "DB_ENCRYPTION_KEY plus either DROPBOX_ACCESS_TOKEN or all three of "
+            "DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET.")
+    st.stop()
+
+# Require a student ID whenever this is a *managed* session — a Director game
+# link (?game=) or any deployment with storage enabled. A plain local run with
+# neither still skips the gate and behaves exactly as before.
+if (game or store.enabled()) and not sid:
     st.title("🥤 Juicetification: The Lean Rush")
     _entered = st.text_input("Enter your student ID to begin", key="_sid_gate")
     if st.button("Start", type="primary") and _entered.strip():
         store.set_student_id(_entered)
         st.rerun()
+    if game and not store.enabled():
+        st.warning("Progress storage isn't detected on this deployment, so "
+                   "progress won't be saved. Instructor: add the storage secrets "
+                   "(open this page with `?diag=1` to check which are missing).")
     st.stop()                     # don't build the lab until a student id exists
 
 STATION_EMOJI = {"Cups": "🥤", "Fruit": "🍓", "Ice": "🧊",
@@ -2220,8 +2248,10 @@ else:
     plan = CONTINUE                       # guided, past the scripted rounds
 unlocked = set(plan["unlock"])
 
-if store.enabled() and sid:
-    st.caption(f"Signed in as {sid} · progress saved automatically")
+if sid:
+    st.caption(f"Signed in as {sid}"
+               + (" · progress saved automatically" if store.enabled()
+                  else " · (progress storage not detected)"))
 st.markdown(f"🏪 {SC['briefing']}")
 st.subheader(plan["title"])
 st.info(f"🎯 **Your goal:** {plan['focus']}")
