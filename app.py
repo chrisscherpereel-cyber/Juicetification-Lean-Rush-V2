@@ -7,7 +7,9 @@ Run with:  streamlit run app.py
 from __future__ import annotations
 
 
+import hashlib
 import heapq
+import json
 import math
 import random
 import statistics
@@ -793,6 +795,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import FancyArrowPatch, FancyBboxPatch, Circle
 
 import streamlit as st
+import student_store as store   # per-student progress (safe no-op when unconfigured)
 
 try:
     from streamlit_sortables import sort_items
@@ -815,6 +818,19 @@ CFG, CTX = resolve_config(MANIFEST)
 HORIZON_S = CFG["horizon_s"]
 BLEND_SETUP = CFG["blend_setup"]
 HANDOFF_TIME = CFG["handoff_time"]
+
+# ---- per-student persistence (student_store): identity + resume gate ---------
+# When storage is unconfigured, store.enabled() is False and every store call is
+# a safe no-op, so the app behaves exactly as before (no gate, random seed).
+game = store.game_code()          # ?game= code (or None)
+sid = store.get_student_id()      # ?sid= student id (or None)
+if store.enabled() and not sid:
+    st.title("🥤 Juicetification: The Lean Rush")
+    _entered = st.text_input("Enter your student ID to begin", key="_sid_gate")
+    if st.button("Start", type="primary") and _entered.strip():
+        store.set_student_id(_entered)
+        st.rerun()
+    st.stop()                     # don't build the lab until a student id exists
 
 STATION_EMOJI = {"Cups": "🥤", "Fruit": "🍓", "Ice": "🧊",
                  "Blender": "🌀", "Finish": "🏷️", "Pickup": "🧍"}
@@ -1065,10 +1081,12 @@ def _baseline_cfg(scenario):
 
 def _init_state(new_seed=None):
     if new_seed is not None or "round" not in st.session_state:
-        # honour an explicit new seed, else a Director-provided ?seed=, else random
+        # honour an explicit new seed, else a Director-provided ?seed=, else a
+        # stable per-student seed derived from the student id, else random.
         seed = (new_seed if new_seed is not None
                 else (CTX["seed"] if CTX["seed"] is not None
-                      else _random.randint(0, 10**6)))
+                      else (store.derive_seed(game, sid, lo=0, hi=10**6) if sid
+                            else _random.randint(0, 10**6))))
         sc = make_scenario(seed)
         st.session_state.scenario = sc
         st.session_state.round = 1
@@ -1087,7 +1105,85 @@ def _init_state(new_seed=None):
         st.session_state.asked_coach = set()  # coach question ids already used
 
 
+# ---- progress persistence (student_store) -----------------------------------
+# Only these session-state keys are persisted/resumed. Transient objects
+# (last_result, last_cfg, baseline), figures, RNGs and widget keys are excluded.
+PROGRESS_KEYS = ["round", "history", "cfg", "scenario", "game_mode",
+                 "reflections", "tested", "staged", "coach_q", "asked_coach",
+                 "goal_reached_once", "student"]
+
+
+def _jsonable(o):
+    """Recursively coerce to plain JSON: numpy -> python, sets -> sorted lists,
+    DataFrames -> dict-of-lists, anything else -> str (never raises)."""
+    if isinstance(o, dict):
+        return {str(k): _jsonable(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_jsonable(v) for v in o]
+    if isinstance(o, set):
+        return sorted(_jsonable(v) for v in o)
+    if o is None or isinstance(o, (str, bool, int, float)):
+        return o
+    if hasattr(o, "to_dict"):                 # pandas DataFrame / Series
+        try:
+            return o.to_dict("list")
+        except Exception:
+            try:
+                return o.to_dict()
+            except Exception:
+                return str(o)
+    if hasattr(o, "tolist"):                  # numpy array
+        return _jsonable(o.tolist())
+    if hasattr(o, "item"):                    # numpy scalar
+        try:
+            return o.item()
+        except Exception:
+            return str(o)
+    return str(o)
+
+
+def _progress_snapshot():
+    ss = st.session_state
+    return {k: _jsonable(ss[k]) for k in PROGRESS_KEYS if k in ss}
+
+
+def _restore_progress(saved):
+    for k in PROGRESS_KEYS:
+        if k not in saved:
+            continue
+        v = saved[k]
+        if k == "asked_coach":
+            v = set(v or [])
+        elif k == "coach_q" and isinstance(v, dict):
+            v = {int(rk): rv for rk, rv in v.items()}   # JSON stringified int keys
+        st.session_state[k] = v
+
+
+def _autosave():
+    """Persist the current snapshot, but only when it has actually changed, so a
+    save happens on each meaningful step (answer, round, rush) and never on idle
+    reruns. A no-op when storage is unconfigured or no student is identified."""
+    if not (store.enabled() and sid):
+        return
+    snap = _progress_snapshot()
+    sig = json.dumps(snap, sort_keys=True, separators=(",", ":"))
+    if sig == st.session_state.get("_last_saved_sig"):
+        return
+    try:
+        store.save(game, sid, snap)
+        st.session_state["_last_saved_sig"] = sig
+    except Exception:
+        pass
+
+
 _init_state()
+# resume: overlay any saved progress exactly once per session, before the app
+# binds C/SC from session_state below.
+if store.enabled() and sid and not st.session_state.get("_restored"):
+    _saved = store.load(game, sid)
+    if _saved:
+        _restore_progress(_saved)
+    st.session_state["_restored"] = True
 C = st.session_state.cfg
 SC = st.session_state.scenario
 
@@ -2124,6 +2220,8 @@ else:
     plan = CONTINUE                       # guided, past the scripted rounds
 unlocked = set(plan["unlock"])
 
+if store.enabled() and sid:
+    st.caption(f"Signed in as {sid} · progress saved automatically")
 st.markdown(f"🏪 {SC['briefing']}")
 st.subheader(plan["title"])
 st.info(f"🎯 **Your goal:** {plan['focus']}")
@@ -2717,6 +2815,7 @@ if run:
     st.session_state.tested = []
     st.session_state.staged = []
     st.session_state.scroll_top = True     # jump to top so results are seen first
+    _autosave()                            # persist the finished rush / new round
     st.rerun()
 
 res = st.session_state.last_result
@@ -2749,6 +2848,16 @@ if res is not None:
                     f"healthy profit of **${res.profit:.0f}**. Here's your detailed "
                     "debrief. **Free play** is now unlocked in the sidebar if you "
                     "want to keep experimenting.")
+            # persist a completion record for the Director (once; no-op when
+            # storage is unconfigured)
+            if not st.session_state.get("_completion_recorded"):
+                _code = "LR-" + hashlib.sha256(
+                    f"{game or ''}|{sid or ''}|{SC['sid']}".encode()
+                ).hexdigest()[:8].upper()
+                store.record_completion(game, sid, completion_code=_code,
+                                        score=round(res.profit, 1))
+                st.session_state["_completion_recorded"] = True
+                _autosave()
             st.markdown("## 🎓 Debrief — make sense of the whole game")
             st.caption("Research on simulations is blunt: most of the learning "
                        "happens *here*, in the reflection — not in the playing. "
@@ -2975,4 +3084,10 @@ if st.session_state.get("scroll_top"):
         "window.parent.scrollTo(0,0);}catch(x){}}"
         "for(var i=0;i<15;i++){setTimeout(jrTop,i*90);}"
         "</script>", height=0)
+
+
+# ---- autosave: persist progress on any run where the snapshot changed --------
+# (covers coach answers, plan commits, reflections and knowledge-check answers;
+#  a signature guard means idle reruns don't re-upload). No-op when unconfigured.
+_autosave()
 

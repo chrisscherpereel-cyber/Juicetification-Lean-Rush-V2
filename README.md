@@ -179,6 +179,25 @@ patience, baseline defect range, inherited batch and made-ahead ranges), the
 Score and profit required to finish). Nothing in the Director changes when a
 manifest is edited — that is the point of the split.
 
+### Per-student progress and resume (`student_store.py`)
+
+The app can persist each student's progress and write a completion record via
+the shared `student_store` module. It is a **safe no-op until configured**, so
+`streamlit run app.py` works with no secrets set. When configured (an encryption
+key plus Dropbox credentials — see the module header), the app:
+
+- **gates on a student ID** (from `?sid=`) before the lab starts;
+- gives each student a **stable, unique scenario** derived from their ID, so a
+  refresh or a return visit lands on the same shop;
+- **autosaves** progress after each meaningful step and **restores** it on load
+  (`?sid=` in the URL makes resume automatic); and
+- **records a completion** (code + P&L) the Director can read for grading.
+
+Only game logic-free progress state is stored — decisions, round, history,
+reflections and coach state — as plain JSON; figures, RNGs and transient
+simulation objects are never persisted. The optional `cryptography` and `dropbox`
+packages (commented in `requirements.txt`) are only needed once storage is on.
+
 ---
 
 ## Design notes
@@ -202,6 +221,7 @@ juicetification-lean-rush/
 ├── app.py                     # the entire application — engine + UI in one file
 ├── juice_director.py          # shared Director config loader (drop-in, unmodified)
 ├── manifest.py                # instructor-configurable parameter schema
+├── student_store.py           # per-student progress/resume (drop-in; no-op unless configured)
 ├── requirements.txt           # Python dependencies
 ├── README.md
 ├── LICENSE                    # MIT
