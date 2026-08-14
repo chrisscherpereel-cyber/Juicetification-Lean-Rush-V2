@@ -1204,6 +1204,18 @@ def _autosave():
         pass
 
 
+def _clear_transient_state():
+    """Drop per-round widget state and end-of-game flags so a New scenario /
+    Restart truly starts clean (no stale answers, no report left unlocked)."""
+    _pfx = ("coachmc_", "plancommit_", "helped_", "dquiz_", "debrief_",
+            "roibtn_", "order_dnd_")
+    _flags = {"dryrun_cache", "roirows", "goal_reached_once", "debrief_ready",
+              "_completion_recorded", "_last_saved_sig"}
+    for k in list(st.session_state.keys()):
+        if k in _flags or k.startswith(_pfx):
+            st.session_state.pop(k, None)
+
+
 _init_state()
 # resume: overlay any saved progress exactly once per session, before the app
 # binds C/SC from session_state below.
@@ -2208,14 +2220,14 @@ setInterval(jrPhase,300);jrPhase();
     cN, cR = st.columns(2)
     if cN.button("🎲 New scenario", use_container_width=True,
                  help="A fresh random shop — different demand, twist, and layout."):
+        _clear_transient_state()
         _init_state(new_seed=_random.randint(0, 10**6))
+        st.session_state.scroll_top = True
         st.rerun()
     if cR.button("🔄 Restart", use_container_width=True,
                  help="Same scenario, start the rounds over."):
         sc = st.session_state.scenario
-        for k in ("round", "history", "last_result", "last_cfg", "cfg",
-                  "baseline", "tested", "reflections", "staged"):
-            st.session_state.pop(k, None)
+        _clear_transient_state()
         st.session_state.round = 1
         st.session_state.history = []
         st.session_state.last_result = None
@@ -2228,6 +2240,7 @@ setInterval(jrPhase,300);jrPhase();
         st.session_state.coach_q = {}
         st.session_state.asked_coach = set()
         st.session_state.order_nonce += 1
+        st.session_state.scroll_top = True
         st.rerun()
 
 
@@ -3101,9 +3114,16 @@ with st.expander("📄 Progress report — download for your LMS", expanded=Fals
 # ==========================================================================
 if st.session_state.get("scroll_top"):
     st.session_state.scroll_top = False
+    # Embed a per-navigation token so the injected HTML is UNIQUE every time.
+    # Identical component HTML lets Streamlit keep the existing iframe (the script
+    # would not re-run); a changing token forces a remount so the scroll re-fires
+    # on every navigation, not just the first.
+    _nav_tok = st.session_state.get("_nav_seq", 0) + 1
+    st.session_state["_nav_seq"] = _nav_tok
     import streamlit.components.v1 as _components2
     _components2.html(
         "<script>"
+        f"var JR_NAV={_nav_tok};"        # unique per navigation -> forces remount
         "function jrTop(){try{var d=window.parent.document;"
         "var sels=['[data-testid=\"stMain\"]','section.main','.main',"
         "'[data-testid=\"stAppViewContainer\"]'];"
