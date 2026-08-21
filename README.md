@@ -148,7 +148,17 @@ KPI cards, a round-by-round table, decisions per round, and every recorded answe
 - **Two modes.** *Guided* walks through the wastes and opens one decision at a
   time (the coach's highest-payoff pick); *Free play* unlocks every control.
 - **Grade the reasoning, not the score.** The report's reflections and knowledge
-  check are the assessable artifact; the Lean Score is feedback, not the goal.
+  check are the assessable artifact; the Lean Score is feedback, not the goal. A
+  first-round panel in the app now tells students up front that the debrief is
+  required and reviewed, which discourages "max everything" speed-runs.
+- **Plan ~30–45 minutes, ideally in one sitting.** Without per-student storage
+  configured, progress lives only in the browser session and is lost on refresh
+  or after the tab sits idle (Streamlit reclaims idle sessions). To let students
+  pause and resume, hand out **signed-in `?game=…&sid=…` links** with storage
+  configured (see *Per-student progress and resume* above) — the app then saves
+  and restores automatically and shows a "Signed in / progress saved" note.
+- **Two modes.** *Guided* walks through the wastes and opens one decision at a
+  time (the coach's highest-payoff pick); *Free play* unlocks every control.
 - **Scenario settings** (demand, replications) can be overridden in the sidebar.
 - Class discussion prompts that work well: *Why did your best first move differ
   from your neighbour's? Which change did you keep that you shouldn't have?*

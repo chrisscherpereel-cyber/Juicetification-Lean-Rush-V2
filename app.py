@@ -2265,6 +2265,29 @@ if sid:
     st.caption(f"Signed in as {sid}"
                + (" · progress saved automatically" if store.enabled()
                   else " · (progress storage not detected)"))
+
+# One-time orientation, shown only while planning the very first round. It sets
+# expectations up front (time, save behaviour, the required/reviewed debrief) so
+# students who skip the printed handout still know the ground rules.
+if st.session_state.round == 1 and not st.session_state.history:
+    _saves = (sid and store.enabled())
+    with st.expander("ℹ️  Before you begin — please read", expanded=True):
+        st.markdown(
+            "- ⏱️ **Plan about 30–45 minutes.** It's best done in one sitting.\n"
+            + ("- 💾 **Your progress saves automatically** — you can close the tab and "
+               "return to the same link later to pick up where you left off.\n"
+               if _saves else
+               "- 💾 **Finish in one sitting.** Your work is kept only for this browser "
+               "session, so don't leave the tab idle for long or refresh — you may "
+               "lose your progress.\n")
+            + "- 🎓 **There is a required debrief.** The game ends with short written "
+              "reflections and a knowledge check that are **required and reviewed by "
+              "your instructor**; your report unlocks only after you finish them. Play "
+              "to *learn the ideas*, not just to hit the numbers.\n"
+            + "- ▶️ **How each round works:** run the rush → read what went wrong → "
+              "answer the coach → change one decision → run again, until you've "
+              "addressed all seven wastes with a solid Lean Score and a profit.")
+
 st.markdown(f"🏪 {SC['briefing']}")
 st.subheader(plan["title"])
 st.info(f"🎯 **Your goal:** {plan['focus']}")
