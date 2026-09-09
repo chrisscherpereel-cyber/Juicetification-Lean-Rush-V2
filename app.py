@@ -804,7 +804,13 @@ except Exception:                       # library not installed -> button fallba
     HAVE_DND = False
 
 st.set_page_config(page_title="Juicetification: The Lean Rush", page_icon="🥤",
-                   layout="wide")
+                   layout="wide", initial_sidebar_state="expanded")
+
+# Darken the small caption/help text — the default light grey was hard to read.
+st.markdown(
+    "<style>[data-testid='stCaptionContainer'],"
+    "[data-testid='stCaptionContainer'] p{color:#3b3b3b !important;}</style>",
+    unsafe_allow_html=True)
 
 # ---- Juicetification Director: instructor-configurable scenario/grading -----
 # With no ?cfg=/?game= URL parameter, CFG == built-in defaults and the app is
@@ -1138,7 +1144,7 @@ def _init_state(new_seed=None):
 # (last_result, last_cfg, baseline), figures, RNGs and widget keys are excluded.
 PROGRESS_KEYS = ["round", "history", "cfg", "scenario", "game_mode",
                  "reflections", "tested", "staged", "coach_q", "asked_coach",
-                 "goal_reached_once", "student"]
+                 "goal_reached_once", "student", "last_cdict", "last_seed"]
 
 
 def _jsonable(o):
@@ -1210,7 +1216,7 @@ def _clear_transient_state():
     _pfx = ("coachmc_", "plancommit_", "helped_", "dquiz_", "debrief_",
             "roibtn_", "order_dnd_")
     _flags = {"dryrun_cache", "roirows", "goal_reached_once", "debrief_ready",
-              "_completion_recorded", "_last_saved_sig"}
+              "_completion_recorded", "_last_saved_sig", "last_cdict", "last_seed"}
     for k in list(st.session_state.keys()):
         if k in _flags or k.startswith(_pfx):
             st.session_state.pop(k, None)
@@ -1240,6 +1246,24 @@ def cfg_from_state(s):
         premade=s["premade"], demand_level=s["demand"], replications=s["reps"],
         time_mult={SC["slow"]: SC["slow_mult"]}, demand_mult=SC["demand_mult"],
         patience_mean=SC["patience"], defect_base=SC["defect_base"])
+
+
+# Resume recovery: last_result / last_cfg are transient objects that are NOT
+# saved, so after a browser refresh, an idle reconnect, or a signed-in return
+# they are None even though the round has advanced. Rebuild them deterministically
+# from the saved decision snapshot + seed, BEFORE the CHECK/ACT panel is rendered
+# below, so the coach question reappears and the student can answer it and advance.
+# (Previously the panel was skipped and the DO button stayed locked — "stuck".)
+if (st.session_state.get("last_result") is None
+        and st.session_state.get("last_cdict") is not None
+        and st.session_state.get("history")):
+    try:
+        _lc = cfg_from_state(st.session_state["last_cdict"])
+        st.session_state.last_cfg = _lc
+        st.session_state.last_result = sim.run_simulation(
+            _lc, base_seed=st.session_state.get("last_seed", 1000))
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -2301,14 +2325,17 @@ st.caption("🔁 This page is one turn of the **PDCA / kaizen** cycle, read as a
 # ---- which of the 7 waste-decisions are unlocked this round (needed early) ----
 WASTE_KEYS = ["overproduction", "transport", "motion", "overprocessing",
               "inventory", "defects", "waiting"]
+_sched = {1: set(),
+          2: {"overproduction", "transport"},
+          3: {"overproduction", "transport", "motion", "overprocessing", "defects"},
+          4: set(WASTE_KEYS)}
 if not guided or rnd not in ROUND_PLAN:
     dec_unlocked = set(WASTE_KEYS)
+    _new_this_round = set()               # nothing is "new" in free play / late rounds
 else:
-    _sched = {1: set(),
-              2: {"overproduction", "transport"},
-              3: {"overproduction", "transport", "motion", "overprocessing", "defects"},
-              4: set(WASTE_KEYS)}
     dec_unlocked = _sched.get(rnd, set(WASTE_KEYS))
+    # decisions unlocked THIS round that weren't available last round → flag as new
+    _new_this_round = dec_unlocked - _sched.get(rnd - 1, set())
 # Which decision expanders open by default. In guided mode we open ONLY the single
 # decision the coach points at (its highest-payoff waste, added in the ACT block
 # below) and keep the rest collapsed. Free play opens everything.
@@ -2505,7 +2532,7 @@ if _res is not None:
         st.markdown(f"### 🥋 ACT — Coaching Kata (Round {_lastr})")
         st.caption("**Act** on what CHECK just showed: the five questions a lean "
                    "coach asks to turn results into your next experiment. Answer #3 "
-                   "to unlock the **DO** button in the sidebar.")
+                   "to unlock the **DO** button in the **sidebar**.")
         st.markdown("**1. Target condition** — where you're headed:  \n"
                     "*A lean, profitable shop — serve nearly everyone, few wrong "
                     "drinks, little waste: a high Lean Score with healthy profit.*")
@@ -2600,8 +2627,12 @@ def _button_reorder():
 
 
 def _dec(key, title, five_s_tag, cost_txt):
-    exp = key in _focus or (not guided)
-    return st.expander(f"{title}   ·   {five_s_tag}   ·   💲 {cost_txt}", expanded=exp)
+    _new = key in _new_this_round
+    # newly unlocked decisions are flagged 🆕 and opened so students notice them
+    exp = _new or key in _focus or (not guided)
+    _badge = "🆕 NEW · " if _new else ""
+    return st.expander(f"{_badge}{title}   ·   {five_s_tag}   ·   💲 {cost_txt}",
+                       expanded=exp)
 
 
 st.markdown("<div id='jr-plan'></div>", unsafe_allow_html=True)
@@ -2609,6 +2640,15 @@ st.markdown("### 🛠️ PLAN — make your decisions (one per waste)")
 st.caption("Each of the **7 wastes** has a counter-measure. Notice **five of them "
            "are exactly the 5 S's**; the last two (Defects, Waiting) need quality "
            "tools and capacity. Cost per rush is shown on each.")
+
+# Call out decisions that just unlocked this round (flagged 🆕 and opened below).
+if _new_this_round:
+    _NAMES = {"overproduction": "Overproduction", "transport": "Transport",
+              "motion": "Motion", "overprocessing": "Overprocessing",
+              "inventory": "Inventory", "defects": "Defects", "waiting": "Waiting"}
+    _new_labels = [_NAMES[w] for w in WASTE_KEYS if w in _new_this_round]
+    st.success("🆕 **New this round:** " + ", ".join(_new_labels)
+               + " — the 🆕 decisions below just unlocked.")
 
 # The coach's directive shows here ONLY if the student requested help at the top.
 _lr = st.session_state.history[-1]["round"] if st.session_state.history else None
@@ -2619,7 +2659,7 @@ if _cq_prev and st.session_state.get(f"helped_{_lr}"):
 
 if not dec_unlocked:
     st.info("Round 1 is your baseline — just press the flashing **RUN** button in "
-            "the sidebar. Decisions unlock next round.")
+            "the **sidebar** (top-left). Decisions unlock next round.")
 
 with st.container():
     # 1. Overproduction  →  5S #1 Sort
@@ -2629,10 +2669,10 @@ with st.container():
             st.caption("**Sort: keep only what's needed.** Made-ahead drinks go "
                        "stale (wrong orders) or get binned (waste). One-piece flow "
                        "= make each drink only when ordered.")
-            C["batch"] = st.slider("Blend batch size (drinks per cycle)", 1, 6,
-                                   C["batch"], help="1 = one at a time.")
-            C["premade"] = st.slider("Pre-made drinks staged at open", 0, 20,
-                                     C["premade"])
+            C["batch"] = st.number_input("Blend batch size (drinks per cycle)", 1, 6,
+                                         C["batch"], help="1 = one at a time.")
+            C["premade"] = st.number_input("Pre-made drinks staged at open", 0, 20,
+                                           C["premade"])
 
     # 2. Transport  →  5S #2 Set in order
     if "transport" in dec_unlocked:
@@ -2648,9 +2688,10 @@ with st.container():
                   "ingredients", "5S #3 Shine", f"${fcost}/rush"):
             st.caption("**Shine: clean & label.** A tidy, labeled station means no "
                        "searching. Higher levels cost more upkeep.")
-            C["five_s"] = st.select_slider(
-                "Clean & label level", ["Disorganized", "Basic", "Full 5S"],
-                value=C["five_s"], label_visibility="collapsed")
+            _fs = ["Disorganized", "Basic", "Full 5S"]
+            C["five_s"] = st.selectbox(
+                "Clean & label level", _fs, index=_fs.index(C["five_s"]),
+                label_visibility="collapsed")
             st.caption(f"Upkeep now: **${fcost}/rush**.")
 
     # 4. Overprocessing  →  5S #4 Standardize
@@ -2662,9 +2703,9 @@ with st.container():
                        "most of the benefit; the top tier costs a lot for little "
                        "extra.")
             snames = [f"{i}. {l['name']}" for i, l in enumerate(sim.STANDARD_LEVELS)]
-            spick = st.select_slider("Standard work level", snames,
-                                     value=snames[C["standard_level"]],
-                                     label_visibility="collapsed")
+            spick = st.selectbox("Standard work level", snames,
+                                 index=C["standard_level"],
+                                 label_visibility="collapsed")
             C["standard_level"] = snames.index(spick)
             sl = sim.STANDARD_LEVELS[C["standard_level"]]
             st.caption(f"**{sl['name']}** — {sl['desc']}  ·  ${sl['cost']:.0f}/rush.")
@@ -2695,9 +2736,9 @@ with st.container():
                        "recipes above also cut defects.) Cheaper tiers give most of "
                        "the benefit.")
             vnames = [f"{i}. {l['name']}" for i, l in enumerate(sim.VISUAL_LEVELS)]
-            vpick = st.select_slider("Visual signal level", vnames,
-                                     value=vnames[C["visual_level"]],
-                                     label_visibility="collapsed")
+            vpick = st.selectbox("Visual signal level", vnames,
+                                 index=C["visual_level"],
+                                 label_visibility="collapsed")
             C["visual_level"] = vnames.index(vpick)
             vl = sim.VISUAL_LEVELS[C["visual_level"]]
             st.caption(f"**{vl['name']}** — {vl['desc']}  ·  ${vl['cost']:.0f}/rush.")
@@ -2714,7 +2755,7 @@ with st.container():
                                  ["Whole-order", "Specialized stations"],
                                  index=0 if C["mode"] == "Whole-order" else 1)
             if C["mode"] == "Whole-order":
-                C["employees"] = st.slider("Baristas", 1, 6, C["employees"])
+                C["employees"] = st.number_input("Baristas", 1, 6, C["employees"])
             else:
                 scg = st.columns(3)
                 C["spec_prep"] = scg[0].number_input("Prep", 0, 5, C["spec_prep"])
@@ -2723,8 +2764,8 @@ with st.container():
                 C["employees"] = max(1, C["spec_prep"] + C["spec_blend"]
                                      + C["spec_finish"])
                 st.caption(f"Total baristas: **{C['employees']}**")
-            C["blenders"] = st.slider("🌀 Blenders ($12/rush each)", 1, 4,
-                                      C["blenders"])
+            C["blenders"] = st.number_input("🌀 Blenders ($12/rush each)", 1, 4,
+                                            C["blenders"])
 
     # always show the workflow picture + the derived 5S board so the two
     # frameworks stay front-and-center
@@ -2876,6 +2917,10 @@ if run:
         res = sim.run_simulation(cfg, base_seed=1000 + rnd)
     st.session_state.last_result = res
     st.session_state.last_cfg = copy.deepcopy(cfg)
+    # JSON-able snapshot of exactly what was run + its seed, so a resumed session
+    # can rebuild last_result deterministically (see the rebuild block below).
+    st.session_state.last_cdict = dict(C)
+    st.session_state.last_seed = 1000 + rnd
     st.session_state.history.append(summarize(res, cfg))
     st.session_state.round += 1
     st.session_state.tested = []
