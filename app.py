@@ -812,6 +812,79 @@ st.markdown(
     "[data-testid='stCaptionContainer'] p{color:#3b3b3b !important;}</style>",
     unsafe_allow_html=True)
 
+# ---- styling for the REQUIRED coach question (students were scrolling past it) --
+st.markdown("""
+<style>
+@keyframes jrAskPulse{0%,100%{box-shadow:0 0 0 0 rgba(230,57,70,.50);}
+ 50%{box-shadow:0 0 0 12px rgba(230,57,70,0);}}
+@keyframes jrFlashNow{0%{box-shadow:0 0 0 10px rgba(230,57,70,.85);}
+ 100%{box-shadow:0 0 0 0 rgba(230,57,70,0);}}
+.jr-ask{border:3px solid #e63946;background:#fff5f3;border-radius:12px;
+ padding:14px 16px 12px;margin:12px 0 6px;animation:jrAskPulse 1.8s infinite;}
+.jr-ask.done{border-color:#2a9d8f;background:#eefaf7;animation:none;}
+.jr-ask.jr-flash{animation:jrFlashNow 1.6s ease-out 1;}
+.jr-ask-tag{display:inline-block;background:#e63946;color:#fff;font-weight:800;
+ font-size:12px;letter-spacing:.05em;text-transform:uppercase;padding:4px 10px;
+ border-radius:999px;margin-bottom:9px;}
+.jr-ask.done .jr-ask-tag{background:#2a9d8f;}
+.jr-ask-h{font-size:1.22rem;font-weight:800;color:#1d1d1d;margin-bottom:4px;}
+.jr-ask-q{font-size:1.06rem;line-height:1.5;color:#222;}
+.jr-ask-hint{font-size:.86rem;color:#8a2b33;margin-top:8px;font-weight:600;}
+.jr-ask.done .jr-ask-hint{color:#1f6f66;}
+</style>""", unsafe_allow_html=True)
+
+import re as _re_md
+
+
+def _mini_md(text):
+    """Escape HTML, then honour the **bold** / *italic* used in question text."""
+    t = (str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+    t = _re_md.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t)
+    t = _re_md.sub(r"(?<!\*)\*([^*]+?)\*(?!\*)", r"<i>\1</i>", t)
+    return t
+
+
+def jr_jump_button(label="⬆️ Take me to the coach's question",
+                   target="jr-act", flash="jr-coachq", height=60):
+    """A button that scrolls the main page up to the coach's question and makes
+    the question card flash, so a locked student is one click from the fix."""
+    import streamlit.components.v1 as _c
+    _c.html("""
+<button id="jrjump" onclick="jrGo()">""" + label + """</button>
+<style>
+ html,body{margin:0;padding:0;}
+ #jrjump{width:100%;cursor:pointer;border:0;border-radius:9px;padding:11px 12px;
+  font-family:"Source Sans Pro","Segoe UI",sans-serif;font-size:15px;
+  font-weight:700;color:#fff;background:#e63946;
+  box-shadow:0 2px 6px rgba(0,0,0,.18);}
+ #jrjump:hover{background:#c62936;}
+</style>
+<script>
+function jrGo(){
+  var P=window.parent,D=P.document;
+  var el=D.getElementById(\"""" + target + """\");
+  if(!el){return;}
+  var node=el.parentElement,sc=null;
+  while(node){
+    var s=P.getComputedStyle(node);
+    if(/(auto|scroll)/.test(s.overflowY)&&node.scrollHeight>node.clientHeight+4){
+      sc=node;break;}
+    node=node.parentElement;
+  }
+  var off=95;
+  if(sc){
+    sc.scrollTo({top:sc.scrollTop+el.getBoundingClientRect().top
+      -sc.getBoundingClientRect().top-off,behavior:"smooth"});
+  }else{
+    P.scrollTo({top:P.scrollY+el.getBoundingClientRect().top-off,
+      behavior:"smooth"});
+  }
+  var f=D.getElementById(\"""" + flash + """\");
+  if(f){f.classList.remove("jr-flash");void f.offsetWidth;
+        f.classList.add("jr-flash");}
+}
+</script>""", height=height)
+
 # ---- Juicetification Director: instructor-configurable scenario/grading -----
 # With no ?cfg=/?game= URL parameter, CFG == built-in defaults and the app is
 # unchanged. See manifest.py for the parameter schema and juice_director.py for
@@ -2167,6 +2240,7 @@ with st.sidebar:
                     type="primary", use_container_width=True, disabled=need_run)
     if need_coach:
         st.caption("🔒 Step 1: **answer the coach** at the top (Act on your result).")
+        jr_jump_button("⬆️ Go to the coach's question", height=56)
     elif need_plan:
         st.caption("🔒 Step 2: **make & commit your plan** on the right, then run.")
     else:
@@ -2528,6 +2602,7 @@ if _res is not None:
     if _coach_target and _coach_target != "any":
         _focus = _focus | {_coach_target}
     _ckey2 = f"coachmc_{_lastr}"
+    _answered = st.session_state.get(_ckey2) is not None
     with st.container(border=True):
         st.markdown(f"### 🥋 ACT — Coaching Kata (Round {_lastr})")
         st.caption("**Act** on what CHECK just showed: the five questions a lean "
@@ -2540,7 +2615,19 @@ if _res is not None:
                     f"*Lean Score {_res.lean_score:.0f}/100 · served "
                     f"{_res.served:.0f}/{_res.arrivals:.0f} · {_res.defects:.0f} wrong "
                     f"· {_res.waste:.0f} wasted · {_res.abandon_pct:.0f}% walked out.*")
-        st.markdown(f"**3. What obstacle is most in your way?** *(required)*  \n{_cq['q']}")
+        st.markdown(
+            f"""<div id='jr-coachq' class='jr-ask{' done' if _answered else ''}'>
+  <div class='jr-ask-tag'>{'✅ Answered — step 1 complete'
+                           if _answered
+                           else 'Required · this unlocks the DO button'}</div>
+  <div class='jr-ask-h'>3. What obstacle is most in your way?</div>
+  <div class='jr-ask-q'>{_mini_md(_cq['q'])}</div>
+  <div class='jr-ask-hint'>{'You can change your answer below at any time.'
+                            if _answered
+                            else '👇 Pick one of the options below — the ▶️ DO '
+                                 'button in the sidebar stays locked until you do.'}
+  </div>
+</div>""", unsafe_allow_html=True)
         _choice = st.radio("Your answer:", _cq["options"], index=None, key=_ckey2,
                            label_visibility="collapsed")
         if _choice is None:
@@ -2879,6 +2966,9 @@ st.markdown("<div id='jr-do'></div>", unsafe_allow_html=True)
 if need_coach:
     st.warning("✍️ **Answer the coach's question at the top** to unlock the DO "
                "button — diagnosing before acting is the whole skill.")
+    _wj, _ = st.columns([1, 2])
+    with _wj:
+        jr_jump_button("⬆️ Take me to the coach's question")
 
 
 # ==========================================================================
