@@ -45,9 +45,20 @@ COSTS = {
     "ingredients_per_drink": 0.80,
     "spoilage_per_unit": 0.80,
     "drink_price": 4.50,        # revenue per served customer
-    "lost_sale_penalty": 4.50,  # opportunity cost of a walkout
+    # A walkout already costs you the sale (that revenue is simply never earned).
+    # This is ONLY the extra goodwill damage, so a lost customer is not counted
+    # twice -- otherwise buying capacity looks ~2x more profitable than it is and
+    # "hire everyone" becomes the winning strategy.
+    "lost_sale_penalty": 1.25,
     "defect_goodwill": 2.00,    # goodwill hit on top of the refund for a wrong drink
+    "premium_extra_per_drink": 0.35,   # organic/premium fruit upsell
 }
+
+# Floor space is finite. Past this many people on the bar they get in each other's
+# way, so every extra body adds a little time to every task -- over-hiring cannot
+# buy unlimited throughput.
+CROWD_FREE_STAFF = 4        # people the shop fits comfortably
+CROWD_PENALTY = 0.05        # +5% on every task time per person above that
 
 # Per-rush *implementation / upkeep* cost of each lean improvement. Lean is not
 # free: organizing, training, signage and kanban all cost something every rush.
@@ -58,9 +69,41 @@ LEAN_COSTS = {
     "layout_change": 1.0,   # rearranging stations -- almost free
     "five_s_basic": 3.0,    # sort/label/clean upkeep
     "five_s_full": 6.0,     # full 5S program with audits
+    "five_s_consultant": 11.0,  # outside consultant re-audits: no extra benefit
     "pull_system": 3.0,     # kanban + more frequent restock trips
     "fifo": 1.0,            # use-oldest-first labelling/rotation discipline
+    "conveyor": 9.0,        # belt between stations -- expensive way to fix layout
+    "safety_stock": 4.0,    # "order extra of everything, just in case"
 }
+
+# The rep's catalogue: things a shop CAN buy that are not lean counter-measures.
+# Each is honestly priced and honestly described -- none is labelled "bad" -- and
+# the engine models what it really does, which for most of these is very little.
+UPGRADE_COSTS = {
+    "promo_push": 8.0,       # brings more customers you may not be able to serve
+    "robo_juicer": 14.0,     # genuinely faster blending, at a steep price
+    "staging_fridge": 5.0,   # keeps made-ahead drinks colder (more overproduction)
+    "signage": 3.0,          # uniforms + shopfront signage: zero operational effect
+}
+# The 5S / clean-and-label ladder, in order, with what each tier costs per rush.
+FIVE_S_ORDER = ["Disorganized", "Basic", "Full 5S", "Consultant 5S"]
+FIVE_S_COST = {"Disorganized": 0.0, "Basic": LEAN_COSTS["five_s_basic"],
+               "Full 5S": LEAN_COSTS["five_s_full"],
+               "Consultant 5S": LEAN_COSTS["five_s_consultant"]}
+FIVE_S_DESC = {
+    "Disorganized": "Nothing has a home — every fetch is a search.",
+    "Basic": "Sort, label and clean the busy stations. Cheap, big time saving.",
+    "Full 5S": "The whole bar labelled, shadow-boarded and audited in-house.",
+    "Consultant 5S": "An outside firm re-audits the bar every month and issues a "
+                     "certificate. The bar is already labelled and clean.",
+}
+PROMO_DEMAND_MULT = 1.20     # extra arrivals bought by the promo push
+# The promo is a loyalty DISCOUNT: it lifts footfall, but every drink sold during
+# the rush goes out at the offer price -- including to the customers you already
+# had. Volume you cannot serve is bought at the price of the volume you can.
+PROMO_PRICE_FACTOR = 0.80
+ROBO_BLEND_FACTOR = 0.78     # robotic juicer's cut in blend time
+CONVEYOR_WALK_FACTOR = 0.55  # conveyor's cut in walking time
 
 # Tiered improvements.  Each higher tier costs more but the extra benefit shrinks,
 # so students learn that some levels are great value and the top ones are usually
@@ -74,6 +117,10 @@ STANDARD_LEVELS = [
      "desc": "Staff trained to one agreed method. Steady speed, few mistakes."},
     {"name": "Full SOP + audits", "cost": 8.0, "defect": 0.08, "cv": 0.18, "finish": 0.78,
      "desc": "Documented procedures with audits. Small extra gain, a lot more cost."},
+    {"name": "Certified SOP + monthly re-certification", "cost": 13.0, "defect": 0.08,
+     "cv": 0.18, "finish": 0.78,
+     "desc": "Externally certified procedures, re-tested every month. The paperwork "
+             "is impressive; the drinks are made exactly the same way."},
 ]
 VISUAL_LEVELS = [
     {"name": "None", "cost": 0.0, "defect": 0.00,
@@ -84,6 +131,9 @@ VISUAL_LEVELS = [
      "desc": "A screen shows each order. A few fewer errors, noticeably more cost."},
     {"name": "Full display + call lights", "cost": 10.0, "defect": 0.07,
      "desc": "High-tech display with alerts. Tiny extra gain for a big price."},
+    {"name": "AI order-vision system", "cost": 16.0, "defect": 0.07,
+     "desc": "Cameras and machine learning watch every order. The vendor's demo is "
+             "spectacular; your baristas already read the tickets fine."},
 ]
 
 
@@ -96,6 +146,8 @@ def implementation_cost(cfg):
         b["5S upkeep"] = LEAN_COSTS["five_s_basic"]
     elif cfg.five_s == "Full 5S":
         b["5S upkeep"] = LEAN_COSTS["five_s_full"]
+    elif cfg.five_s == "Consultant 5S":
+        b["5S upkeep"] = LEAN_COSTS["five_s_consultant"]
     if cfg.standard_level > 0:
         b["Standard work"] = STANDARD_LEVELS[cfg.standard_level]["cost"]
     if cfg.visual_level > 0:
@@ -104,6 +156,18 @@ def implementation_cost(cfg):
         b["Pull system"] = LEAN_COSTS["pull_system"]
     if cfg.fifo_rotation:
         b["FIFO rotation"] = LEAN_COSTS["fifo"]
+    if cfg.conveyor:
+        b["Conveyor belt"] = LEAN_COSTS["conveyor"]
+    if cfg.safety_stock:
+        b["Safety stock"] = LEAN_COSTS["safety_stock"]
+    if cfg.promo_push:
+        b["Promo push"] = UPGRADE_COSTS["promo_push"]
+    if cfg.robo_juicer:
+        b["Robotic juicer"] = UPGRADE_COSTS["robo_juicer"]
+    if cfg.staging_fridge:
+        b["Staging fridge"] = UPGRADE_COSTS["staging_fridge"]
+    if cfg.signage:
+        b["Uniforms & signage"] = UPGRADE_COSTS["signage"]
     return sum(b.values()), b
 
 # Default layout: (row, col) on a 4x4 floor.  Deliberately bad -- ingredients
@@ -141,13 +205,23 @@ class Config:
     layout: Dict[str, Tuple[int, int]] = field(
         default_factory=lambda: dict(DEFAULT_LAYOUT)
     )
-    five_s: str = "Disorganized"                 # Disorganized / Basic / Full 5S
-    standard_level: int = 0                       # 0..3 tier of standard work
-    visual_level: int = 0                         # 0..3 tier of visual signals
+    five_s: str = "Disorganized"       # Disorganized / Basic / Full 5S / Consultant 5S
+    standard_level: int = 0                       # 0..4 tier of standard work
+    visual_level: int = 0                         # 0..4 tier of visual signals
     batch_size: int = 1                          # drinks made per blend cycle
     pull_replenishment: bool = False
     fifo_rotation: bool = False                  # use-oldest-first stock rotation
     premade: int = 0                             # pre-made drinks staged at open
+
+    # Things the shop can BUY that are not lean counter-measures. All default off,
+    # so nothing changes unless the student chooses to spend the money.
+    conveyor: bool = False                       # belt instead of a sane layout
+    safety_stock: bool = False                   # extra of everything "just in case"
+    promo_push: bool = False                     # marketing that raises demand
+    robo_juicer: bool = False                    # faster blending, steep price
+    staging_fridge: bool = False                 # chilled home for made-ahead drinks
+    signage: bool = False                        # uniforms + shopfront signage
+    premium_ingredients: bool = False            # premium fruit, same drink
 
     # scenario / demand
     demand_level: str = "Normal"                 # Light / Normal / Slammed
@@ -238,7 +312,10 @@ def path_distance(layout: Dict[str, Tuple[int, int]]) -> int:
 
 
 def _five_s_factor(level: str) -> float:
-    return {"Disorganized": 1.6, "Basic": 1.25, "Full 5S": 1.0}.get(level, 1.6)
+    # "Consultant 5S" is a fully-audited version of Full 5S -- the bar is already
+    # clean and labelled, so the extra money buys no extra speed.
+    return {"Disorganized": 1.6, "Basic": 1.25, "Full 5S": 1.0,
+            "Consultant 5S": 1.0}.get(level, 1.6)
 
 
 def _demand_rates(level: str) -> Tuple[float, float]:
@@ -255,7 +332,8 @@ def defect_probability(cfg: Config) -> float:
     p = cfg.defect_base
     p -= STANDARD_LEVELS[cfg.standard_level]["defect"]
     p -= VISUAL_LEVELS[cfg.visual_level]["defect"]
-    p -= {"Disorganized": 0.0, "Basic": 0.015, "Full 5S": 0.03}[cfg.five_s]
+    p -= {"Disorganized": 0.0, "Basic": 0.015, "Full 5S": 0.03,
+          "Consultant 5S": 0.03}.get(cfg.five_s, 0.0)
     return max(0.02, p)
 
 
@@ -300,18 +378,25 @@ def _run_once(cfg: Config, seed: int) -> Dict:
     # Pre-blend / blend / post timings (used by whole-order phased service).
     def _tm(station):                              # per-station "slow day" twist
         return cfg.time_mult.get(station, 1.0)
+    # Crowding: extra bodies past what the bar fits slow every task down.
+    crowd = 1.0 + CROWD_PENALTY * max(0, cfg.employees - CROWD_FREE_STAFF)
     fetch_time = (BASE_STEP_TIME["Cups"] * _tm("Cups")
                   + BASE_STEP_TIME["Fruit"] * _tm("Fruit")
-                  + BASE_STEP_TIME["Ice"] * _tm("Ice")) * fs
+                  + BASE_STEP_TIME["Ice"] * _tm("Ice")) * fs * crowd
     finish_time = (BASE_STEP_TIME["Finish"] * _tm("Finish")
-                   * STANDARD_LEVELS[cfg.standard_level]["finish"])
+                   * STANDARD_LEVELS[cfg.standard_level]["finish"] * crowd)
     # Blending a batch takes one setup + one blend cycle regardless of size; the
     # CUSTOMER still waits the full cycle, so batching does NOT speed their drink.
     # Its only "benefit" is the (batch_size-1) extra drinks made ahead -> premade
     # stock (overproduction) that spoils or gets served stale.
-    blend_time = BASE_STEP_TIME["Blender"] * _tm("Blender") + BLEND_SETUP
-    PREMADE_DEFECT_BONUS = 0.25  # a made-ahead drink is often stale / mismatched
-    motion_time = dist * WALK_SECONDS_PER_UNIT
+    blend_time = (BASE_STEP_TIME["Blender"] * _tm("Blender")
+                  * (ROBO_BLEND_FACTOR if cfg.robo_juicer else 1.0)
+                  + BLEND_SETUP) * crowd
+    # A made-ahead drink is often stale / mismatched. A chilled staging fridge
+    # keeps it cold -- it does not make it the drink the next customer ordered.
+    PREMADE_DEFECT_BONUS = 0.15 if cfg.staging_fridge else 0.25
+    motion_time = (dist * WALK_SECONDS_PER_UNIT
+                   * (CONVEYOR_WALK_FACTOR if cfg.conveyor else 1.0))
     # Specialized mode keeps workers at stations: far less transport.
     spec_motion = HANDOFF_TIME * len(ROUTE)
 
@@ -452,8 +537,9 @@ def _run_once(cfg: Config, seed: int) -> Dict:
 
     # ---- Arrivals (non-homogeneous Poisson via thinning) -------------------
     r0, rpeak = _demand_rates(cfg.demand_level)
-    r0 *= cfg.demand_mult
-    rpeak *= cfg.demand_mult
+    _promo = PROMO_DEMAND_MULT if cfg.promo_push else 1.0
+    r0 *= cfg.demand_mult * _promo
+    rpeak *= cfg.demand_mult * _promo
 
     def rate(t: float) -> float:
         frac = min(1.0, t / HORIZON_S)
@@ -511,25 +597,38 @@ def _run_once(cfg: Config, seed: int) -> Dict:
     # ---- End-of-rush waste: overproduction + spoilage ----------------------
     leftover_premade = sum(premade.values())
     waste_units += leftover_premade                      # unsold made-ahead drinks
-    if not cfg.pull_replenishment:
+    if not cfg.pull_replenishment or cfg.safety_stock:
         # push replenishment overstocks perishable prep -> spoilage; batching
         # makes the overstock worse. FIFO rotation (use-oldest-first) keeps the
         # held stock fresh, so far less of it spoils -- a cheap discipline that
         # mitigates spoilage without lowering the stock level the way pull does.
-        prep_stock = 6 + 3 * (cfg.batch_size - 1)
+        # Safety stock ("order extra just in case") is the opposite move: it
+        # raises the pile whatever else is in place, and perishable extra spoils.
+        prep_stock = (0 if cfg.pull_replenishment else 6 + 3 * (cfg.batch_size - 1))
+        if cfg.safety_stock:
+            prep_stock += 8
+        if cfg.staging_fridge:
+            prep_stock += 4          # more chilled space gets filled with stock
         spoil_rate = 0.05 if cfg.fifo_rotation else 0.15
         waste_units += spoil_rate * prep_stock
 
     horizon_min = HORIZON_S / 60.0
     labor = cfg.employees * COSTS["employee_per_min"] * horizon_min
     equip = cfg.blenders * COSTS["blender_per_rush"]
-    ingredients = len(served) * COSTS["ingredients_per_drink"]
-    spoil = waste_units * COSTS["spoilage_per_unit"]
+    ingredients = len(served) * (COSTS["ingredients_per_drink"]
+                                 + (COSTS["premium_extra_per_drink"]
+                                    if cfg.premium_ingredients else 0.0))
+    spoil = waste_units * (COSTS["spoilage_per_unit"]
+                           + (COSTS["premium_extra_per_drink"]
+                              if cfg.premium_ingredients else 0.0))
     lost = abandoned * COSTS["lost_sale_penalty"]
     # a wrong order is refunded (lost revenue) plus a goodwill hit
-    refunds = defects * (COSTS["drink_price"] + COSTS["defect_goodwill"])
+    refunds = defects * (COSTS["drink_price"]
+                         * (PROMO_PRICE_FACTOR if cfg.promo_push else 1.0)
+                         + COSTS["defect_goodwill"])
     upkeep, _ = implementation_cost(cfg)     # cost of running the lean program
-    revenue = len(served) * COSTS["drink_price"]
+    _price = COSTS["drink_price"] * (PROMO_PRICE_FACTOR if cfg.promo_push else 1.0)
+    revenue = len(served) * _price
     total_cost = labor + equip + ingredients + spoil + lost + refunds + upkeep
 
     # sample the congestion + cumulative curves onto a 30-second grid
@@ -1005,23 +1104,31 @@ FREE_PLAY = {"unlock": GROUPS, "concept": "Kaizen",
              "focus": "Free play: every lever is open. Experiment to push your Lean "
                       "Score and profit higher.",
              "why": "Weigh every tool against its cost and see how high you can go."}
-# Shown once all three objectives are met (guided), so the top banner never tells a
+# Shown once all four objectives are met (guided), so the top banner never tells a
 # finished student to "keep improving."
 DONE_PLAN = {"unlock": GROUPS, "concept": "Kaizen — complete",
              "title": "✅ Objectives met — the core simulation is complete",
-             "focus": "You've addressed all 7 wastes with a high Lean Score and a "
-                      "healthy profit. Scroll down to your **debrief**; keep "
+             "focus": "You've addressed all 7 wastes with a high Lean Score, a "
+                      "healthy profit, and no spending that fails to pay for "
+                      "itself. Scroll down to your **debrief**; keep "
                       "experimenting here if you'd like.",
-             "why": "You met all three objectives — waste, quality/flow, and cost."}
+             "why": "You met all four objectives — waste, quality/flow, profit, "
+                    "and spending that earns its keep."}
 
-def lean_level(cfg, res):
+
+def lean_level(cfg, res, spend_bad=None):
     """A waste is 'addressed' when the student has the right counter-measure DECISION
     in place — so the count reflects the choices they actually made this round, not a
     lucky green outcome. Every counter-measure is cheap and achievable, so 7/7 is
     always reachable. (Waiting is the one exception: it also counts when walkouts are
     already low, because adding capacity you don't need is not lean.) Returns
     (done, total, items)."""
-    capacity_maxed = cfg.employees >= 6 and cfg.blenders >= 4
+    # Capacity only counts as a counter-measure when the LAST unit you bought is
+    # actually earning its money (see spend_audit) -- capacity bought "just in
+    # case" is the Waiting waste dressed up as a fix.
+    _bad = {r["name"] for r in (spend_bad or [])}
+    capacity_added = cfg.employees > 3 or cfg.blenders > 1
+    capacity_pays = capacity_added and not ({"Baristas", "Blenders"} & _bad)
     items = [
         ("Transport — stations lined up in process order",
          backtracks(cfg_layout_order(cfg)) == 0),
@@ -1036,31 +1143,67 @@ def lean_level(cfg, res):
          or (cfg.batch_size == 1 and cfg.premade == 0)),
         ("Defects — standard recipes and/or visual signals",
          cfg.visual_level >= 1 or cfg.standard_level >= 2),
-        ("Waiting — bottleneck relieved (low walkouts) or capacity added",
-         res.abandon_pct < 15 or cfg.employees > 3
-         or cfg.blenders > 1 or capacity_maxed),
+        # Buying capacity is NOT the counter-measure — relieving the constraint is.
+        # This ticks when few customers actually walk out, whether you got there by
+        # speeding the line up or by adding capacity exactly where it was needed.
+        ("Waiting — bottleneck relieved (few walkouts, or capacity added "
+         "where it pays for itself)",
+         res.abandon_pct < 15 or capacity_pays),
     ]
     done = sum(1 for _, x in items if x)
     return done, len(items), items
 
 
-# The core simulation is "complete" only when ALL THREE objectives are met: every
-# waste addressed, a high Lean Score, and a profitable shop. Both targets are set
-# below what a well-run shop reaches in every random scenario (verified: optimized
-# shops score 79-92 and profit $44-143), so the goal is always achievable.
+# The core simulation is "complete" only when ALL FOUR objectives are met: every
+# waste addressed, a high Lean Score, a profitable shop, and no money going to a
+# purchase that doesn't pay for itself. The first three targets sit below what a
+# well-run shop reaches in every random scenario; the fourth cannot be bought
+# past -- it is what stops "switch everything on" from finishing the simulation
+# (verified by sweeping the option space on random scenarios: a disciplined shop
+# has dozens of passing configurations, a maxed-out one has none).
 LEAN_TARGET = CFG["lean_target"]      # Lean Score needed to finish (instructor-set)
 PROFIT_TARGET = CFG["profit_target"]  # profit the shop must clear (instructor-set)
 
 
+_SPEND_CACHE = {}
+
+
+def _spend_sig(cfg):
+    return (tuple(cfg_layout_order(cfg)), cfg.five_s, cfg.standard_level,
+            cfg.visual_level, cfg.pull_replenishment, cfg.fifo_rotation,
+            cfg.batch_size, cfg.premade, cfg.employees, cfg.blenders,
+            cfg.assignment_mode, cfg.demand_level,
+            tuple(bool(getattr(cfg, f)) for f, _ in EXTRA_BUYS))
+
+
+def cached_wasted_spend(cfg):
+    """wasted_spend(), memoised — the objectives panel asks for it several times
+    per render and each answer costs a dozen quick simulations."""
+    sig = _spend_sig(cfg)
+    if sig not in _SPEND_CACHE:
+        if len(_SPEND_CACHE) > 60:
+            _SPEND_CACHE.clear()
+        try:
+            _SPEND_CACHE[sig] = wasted_spend(cfg)
+        except Exception:
+            return []
+    return _SPEND_CACHE[sig]
+
+
 def objectives_status(cfg, res):
-    """The three objectives that must ALL be true to finish the core sim."""
-    done, total, items = lean_level(cfg, res)
+    """The four objectives that must ALL be true to finish the core sim."""
+    waste_rows = cached_wasted_spend(cfg)
+    done, total, items = lean_level(cfg, res, spend_bad=waste_rows)
     wastes_ok = done >= total
     score_ok = res.lean_score >= LEAN_TARGET
     profit_ok = res.profit > PROFIT_TARGET
+    # 4th objective: no money is being spent on something that doesn't pay for
+    # itself. This is what stops "buy every upgrade" from finishing the sim.
+    spend_ok = not waste_rows
     return dict(done=done, total=total, items=items, wastes_ok=wastes_ok,
                 score_ok=score_ok, profit_ok=profit_ok,
-                all_ok=wastes_ok and score_ok and profit_ok)
+                spend_ok=spend_ok, waste_rows=waste_rows,
+                all_ok=wastes_ok and score_ok and profit_ok and spend_ok)
 
 
 LADDER = pd.DataFrame([
@@ -1078,6 +1221,10 @@ LADDER = pd.DataFrame([
      "Make one drink at a time. Resist batching and pre-making."],
     ["7", "Add staff / equipment", "High", "Only if needed",
      "Costs money every shift — add ONLY where customers wait."],
+    ["✋", "Premium tiers, gadgets, promos", "High", "Usually none",
+     "The shop can buy plenty more — top tiers, belts, robots, safety stock, "
+     "marketing. Each is priced; most return less than they cost. Test before "
+     "you buy, and step back anything that isn't paying."],
 ], columns=["Do", "Change", "Cost", "Impact", "Why it's here"])
 
 
@@ -1129,6 +1276,31 @@ DEBRIEF_QUIZ = [
      "answer": "Ordering extra of everything, just in case",
      "explain": "Over-ordering is the opposite of sustaining low, fresh stock. "
                 "One-piece flow, FIFO rotation and pull all keep inventory in check."},
+    {"q": "You already run 'Cards + training' standard work. The vendor offers the "
+           "certified tier for $5 more per rush, and it cuts wrong drinks by about "
+           "the same amount. How should you decide?",
+     "options": ["Compare the EXTRA $5 against the EXTRA return that step buys — "
+                 "and skip it if the return is smaller",
+                 "Buy it — a higher tier of a lean practice is always leaner",
+                 "Buy it if you can afford it out of this rush's profit",
+                 "Buy it, because certification proves the shop is standardized"],
+     "answer": "Compare the EXTRA $5 against the EXTRA return that step buys — "
+               "and skip it if the return is smaller",
+     "explain": "Improvements are judged at the margin: what does the NEXT dollar "
+                "buy? Most ladders give you most of the benefit in the first cheap "
+                "step, and the premium tiers are the classic over-processing trap."},
+    {"q": "Your shop is slow and customers are walking out. A promo push would "
+           "bring 25% more customers through the door. What does it do to a shop "
+           "that can't keep up?",
+     "options": ["Makes things worse — more arrivals means more walkouts and more "
+                 "goodwill lost, on top of the promo's cost",
+                 "Fixes the problem — more revenue covers the inefficiency",
+                 "Nothing much either way",
+                 "Improves flow, because busier staff work faster"],
+     "answer": "Makes things worse — more arrivals means more walkouts and more "
+               "goodwill lost, on top of the promo's cost",
+     "explain": "Demand is not capacity. Selling more into a constrained process "
+                "just multiplies the queue — fix the flow first, then fill it."},
 ]
 
 
@@ -1183,7 +1355,9 @@ def _baseline_cfg(scenario):
                spec_finish=1, blenders=1, standard_level=0, visual_level=0,
                pull=False, fifo=False, batch=scenario["start_batch"],
                premade=scenario["start_premade"], demand=scenario["demand"],
-               reps=8)
+               reps=8, conveyor=False, safety_stock=False, promo_push=False,
+               robo_juicer=False, staging_fridge=False, signage=False,
+               premium_ingredients=False)
 
 
 def _init_state(new_seed=None):
@@ -1287,7 +1461,7 @@ def _clear_transient_state():
     """Drop per-round widget state and end-of-game flags so a New scenario /
     Restart truly starts clean (no stale answers, no report left unlocked)."""
     _pfx = ("coachmc_", "plancommit_", "helped_", "dquiz_", "debrief_",
-            "roibtn_", "order_dnd_")
+            "roibtn_", "order_dnd_", "buy_")
     _flags = {"dryrun_cache", "roirows", "goal_reached_once", "debrief_ready",
               "_completion_recorded", "_last_saved_sig", "last_cdict", "last_seed"}
     for k in list(st.session_state.keys()):
@@ -1316,6 +1490,13 @@ def cfg_from_state(s):
         standard_level=s["standard_level"], visual_level=s["visual_level"],
         batch_size=s["batch"], pull_replenishment=s["pull"],
         fifo_rotation=s["fifo"],
+        conveyor=s.get("conveyor", False),
+        safety_stock=s.get("safety_stock", False),
+        promo_push=s.get("promo_push", False),
+        robo_juicer=s.get("robo_juicer", False),
+        staging_fridge=s.get("staging_fridge", False),
+        signage=s.get("signage", False),
+        premium_ingredients=s.get("premium_ingredients", False),
         premade=s["premade"], demand_level=s["demand"], replications=s["reps"],
         time_mult={SC["slow"]: SC["slow_mult"]}, demand_mult=SC["demand_mult"],
         patience_mean=SC["patience"], defect_base=SC["defect_base"])
@@ -1446,7 +1627,7 @@ FIVE_S_DECISIONS = [
      lambda cfg: backtracks(cfg_layout_order(cfg)) == 0,
      "Stations sit in the exact order a drink is made — no backtracking."),
     ("Shine", "Clean & label level (housekeeping)",
-     lambda cfg: cfg.five_s in ("Basic", "Full 5S"),
+     lambda cfg: cfg.five_s != "Disorganized",
      "Clean, labeled stations so shortages and problems are visible."),
     ("Standardize", "Standard-work level",
      lambda cfg: cfg.standard_level >= 1,
@@ -1551,6 +1732,43 @@ def impact_effort_chart(rows):
 ANALYSIS_SEED = 777
 ANALYSIS_REPS = 6
 
+# Everything the shop can switch ON that is not a tiered lean level: the flag on
+# Config, the name students see, and the state key that drives it.
+EXTRA_BUYS = [
+    ("conveyor", "Conveyor belt"),
+    ("safety_stock", "Safety stock"),
+    ("promo_push", "Loyalty promo push"),
+    ("robo_juicer", "Robotic juicer"),
+    ("staging_fridge", "Staging fridge"),
+    ("signage", "Uniforms & signage"),
+    ("premium_ingredients", "Premium fruit"),
+]
+
+# The rep's catalogue as the student sees it: an honest price and an honest sales
+# pitch. Nothing here is labelled good or bad — that is the student's call, and
+# the "earns its keep" objective is what settles it.
+UPGRADE_SHELF = [
+    ("promo_push", "📣 Loyalty promo push",
+     f"${UPGRADE_COSTS['promo_push']:.0f}/rush",
+     "A social + loyalty-app blitz: about 20% more customers through the door "
+     "during the rush, on a 20%-off loyalty offer that applies to every drink "
+     "sold while it runs."),
+    ("robo_juicer", "🤖 Robotic juicer (lease)",
+     f"${UPGRADE_COSTS['robo_juicer']:.0f}/rush",
+     "Automated blending — about 20% faster per blend cycle than a barista "
+     "running the jug."),
+    ("staging_fridge", "🧊 Chilled staging fridge",
+     f"${UPGRADE_COSTS['staging_fridge']:.0f}/rush",
+     "A cold home for made-ahead drinks and prepped fruit, so what you hold "
+     "stays cold and fewer made-ahead drinks go stale."),
+    ("premium_ingredients", "🍓 Premium organic fruit",
+     f"+${COSTS['premium_extra_per_drink']:.2f}/drink",
+     "Nicer fruit in every drink. Customers pay the same menu price."),
+    ("signage", "🎽 New uniforms & shopfront signage",
+     f"${UPGRADE_COSTS['signage']:.0f}/rush",
+     "Fresh branded uniforms and a new illuminated sign. The shop looks sharp."),
+]
+
 
 def _clone(cfg, **kw):
     c = copy.deepcopy(cfg)
@@ -1578,10 +1796,33 @@ def next_step_options(cfg, allowed=None):
     if cfg.premade > 0:
         opts.append(o("overproduction", "Stop pre-making drinks (Sort)", "No premade",
                       0.0, _clone(cfg, premade=0), {"premade": 0}))
-    if cfg.five_s != "Full 5S":
-        nxt = "Basic" if cfg.five_s == "Disorganized" else "Full 5S"
-        opts.append(o("motion", f"Shine: raise clean-&-label to {nxt}", "5S+", 3.0,
+    if cfg.five_s != sim.FIVE_S_ORDER[-1]:
+        nxt = sim.FIVE_S_ORDER[sim.FIVE_S_ORDER.index(cfg.five_s) + 1]
+        opts.append(o("motion", f"Shine: raise clean-&-label to {nxt}", "5S+",
+                      sim.FIVE_S_COST[nxt] - sim.FIVE_S_COST[cfg.five_s],
                       _clone(cfg, five_s=nxt), {"five_s": nxt}))
+    if not cfg.conveyor:
+        opts.append(o("transport", "Install a conveyor belt between stations",
+                      "Conveyor", sim.LEAN_COSTS["conveyor"],
+                      _clone(cfg, conveyor=True), {"conveyor": True}))
+    if not cfg.safety_stock:
+        opts.append(o("inventory", "Hold safety stock (extra of everything)",
+                      "Safety stock", sim.LEAN_COSTS["safety_stock"],
+                      _clone(cfg, safety_stock=True), {"safety_stock": True}))
+    for _flag, _waste, _label, _short, _cost in (
+            ("promo_push", "waiting", "Run the loyalty promo push", "Promo",
+             sim.UPGRADE_COSTS["promo_push"]),
+            ("robo_juicer", "waiting", "Lease the robotic juicer", "Robo",
+             sim.UPGRADE_COSTS["robo_juicer"]),
+            ("staging_fridge", "overproduction", "Add the staging fridge", "Fridge",
+             sim.UPGRADE_COSTS["staging_fridge"]),
+            ("signage", "motion", "New uniforms & shopfront signage", "Signage",
+             sim.UPGRADE_COSTS["signage"]),
+            ("premium_ingredients", "overprocessing", "Switch to premium fruit",
+             "Premium", 0.35 * 40)):
+        if not getattr(cfg, _flag):
+            opts.append(o(_waste, _label, _short, _cost,
+                          _clone(cfg, **{_flag: True}), {_flag: True}))
     if cfg.standard_level < len(sim.STANDARD_LEVELS) - 1:
         nl = cfg.standard_level + 1
         inc = sim.STANDARD_LEVELS[nl]["cost"] - sim.STANDARD_LEVELS[cfg.standard_level]["cost"]
@@ -1668,6 +1909,9 @@ def plan_changes(old, new):
         ch.append(f"Baristas: {old.employees} → {new.employees}")
     if old.blenders != new.blenders:
         ch.append(f"Blenders: {old.blenders} → {new.blenders}")
+    for _f, _nm in EXTRA_BUYS:
+        if getattr(old, _f) != getattr(new, _f):
+            ch.append(f"{_nm}: {'ON' if getattr(new, _f) else 'off'}")
     return ch
 
 
@@ -1687,7 +1931,7 @@ def debrief_roi(final_cfg, scenario):
                             layout=coords_from_order(list(scenario["order"]))))
     if final_cfg.five_s != "Disorganized":
         rows.append(contrib("5S / clean & label",
-                            {"Basic": 3.0, "Full 5S": 6.0}[final_cfg.five_s],
+                            FIVE_S_COST.get(final_cfg.five_s, 0.0),
                             five_s="Disorganized"))
     if final_cfg.standard_level > 0:
         rows.append(contrib("Standard work",
@@ -1712,7 +1956,80 @@ def debrief_roi(final_cfg, scenario):
                 + (final_cfg.blenders - 1) * sim.COSTS["blender_per_rush"])
         rows.append(contrib("Add capacity", max(0.0, cost),
                             employees=3, blenders=1))
+    for _f, _nm in EXTRA_BUYS:
+        if getattr(final_cfg, _f):
+            _c = (sim.LEAN_COSTS.get(_f) or sim.UPGRADE_COSTS.get(_f)
+                  or sim.COSTS["premium_extra_per_drink"] * max(1.0, base.served))
+            rows.append(contrib(_nm, _c, **{_f: False}))
     return rows
+
+
+# --------------------------------------------------------------------------
+# "Does every dollar earn its keep?" — the marginal audit behind objective 4.
+# --------------------------------------------------------------------------
+# For each thing the shop is PAYING for, we re-run the rush with that one step
+# undone — a tier drops to the next cheaper tier, an extra barista or blender goes
+# away, a switched-on extra goes off — and compare profit. This is the marginal
+# test a real operations manager applies: not "is 5S good?" but "is this LEVEL of
+# 5S worth what the last step cost?". A step that does not pay for itself is
+# waste, however lean-sounding its name.
+SPEND_TOLERANCE = 0.75   # $/rush of simulation noise we forgive
+
+
+def spend_audit(cfg):
+    """[(name, step, $ of the step, Δprofit it buys)] for every paid choice,
+    each compared against the NEXT CHEAPER step rather than against nothing."""
+    base = sim.run_simulation(_clone(cfg), base_seed=ANALYSIS_SEED)
+
+    def step(name, label, cost, **cheaper):
+        v = sim.run_simulation(_clone(cfg, **cheaper), base_seed=ANALYSIS_SEED)
+        return dict(name=name, step=label, cost=cost,
+                    d_profit=base.profit - v.profit)
+
+    rows = []
+    if cfg.five_s != "Disorganized":
+        i = FIVE_S_ORDER.index(cfg.five_s)
+        prev = FIVE_S_ORDER[i - 1]
+        rows.append(step("Clean & label (5S)", f"{prev} → {cfg.five_s}",
+                         FIVE_S_COST[cfg.five_s] - FIVE_S_COST[prev],
+                         five_s=prev))
+    if cfg.standard_level > 0:
+        cur = sim.STANDARD_LEVELS[cfg.standard_level]
+        prv = sim.STANDARD_LEVELS[cfg.standard_level - 1]
+        rows.append(step("Standard work", f"{prv['name']} → {cur['name']}",
+                         cur["cost"] - prv["cost"],
+                         standard_level=cfg.standard_level - 1))
+    if cfg.visual_level > 0:
+        cur = sim.VISUAL_LEVELS[cfg.visual_level]
+        prv = sim.VISUAL_LEVELS[cfg.visual_level - 1]
+        rows.append(step("Visual signals", f"{prv['name']} → {cur['name']}",
+                         cur["cost"] - prv["cost"],
+                         visual_level=cfg.visual_level - 1))
+    if cfg.pull_replenishment:
+        rows.append(step("Pull replenishment", "off → on",
+                         sim.LEAN_COSTS["pull_system"], pull_replenishment=False))
+    if cfg.fifo_rotation:
+        rows.append(step("FIFO rotation", "off → on", sim.LEAN_COSTS["fifo"],
+                         fifo_rotation=False))
+    if cfg.blenders > 1:
+        rows.append(step("Blenders", f"{cfg.blenders - 1} → {cfg.blenders}",
+                         sim.COSTS["blender_per_rush"], blenders=cfg.blenders - 1))
+    if cfg.employees > 1 and cfg.assignment_mode == "Whole-order":
+        wage = sim.COSTS["employee_per_min"] * sim.HORIZON_S / 60.0
+        rows.append(step("Baristas", f"{cfg.employees - 1} → {cfg.employees}",
+                         wage, employees=cfg.employees - 1))
+    for _f, _nm in EXTRA_BUYS:
+        if getattr(cfg, _f):
+            _c = (sim.LEAN_COSTS.get(_f) or sim.UPGRADE_COSTS.get(_f)
+                  or sim.COSTS["premium_extra_per_drink"] * max(1.0, base.served))
+            rows.append(step(_nm, "off → on", _c, **{_f: False}))
+    return rows
+
+
+def wasted_spend(cfg):
+    """The paid steps that do NOT pay for themselves (the ones blocking the
+    'every dollar earns its keep' objective)."""
+    return [r for r in spend_audit(cfg) if r["d_profit"] < -SPEND_TOLERANCE]
 
 
 def _coach_bank(cfg, res):
@@ -1730,6 +2047,9 @@ def _coach_bank(cfg, res):
     _inv_rel = (not cfg.pull_replenishment and not cfg.fifo_rotation
                 and not (cfg.batch_size == 1 and cfg.premade == 0))
     _wait_rel = res.abandon_pct > 15
+    # Is the shop currently paying for something that doesn't pay for itself?
+    _upkeep_now = implementation_cost(cfg)[0]
+    _paying_for_nothing = bool(cached_wasted_spend(cfg))
     _over_focus = "Sort — drop batch size to 1 and pre-made toward 0"
     _over_look = "the inventory map (red stack at pickup) + the Waste number"
     _over_guide = ("A made-ahead drink only helps if it matches the *next* order — "
@@ -1913,6 +2233,32 @@ def _coach_bank(cfg, res):
            "most."),
           "Optimize — spend where each dollar returns the most",
           "the profit-impact test (sorted by Δ profit) + the Costs / ROI tab"),
+        q("spend_1", "any", _paying_for_nothing,
+          (f"You're paying **${_upkeep_now:.0f}/rush** in upkeep and upgrades. "
+           "The objectives say at least one of those purchases isn't earning its "
+           "keep. What does that tell you about it?"),
+          ["It's waste — the shop makes more money without it, so step it back down",
+           "It's fine — a lean practice is worth having at any price",
+           "It just needs more time to pay off",
+           "It's fine as long as the Lean Score went up"], 0,
+          ("A counter-measure that costs more than it returns is waste with a "
+           "lean-sounding name. 👉 Open **Which spending isn't earning its keep?** "
+           "under the objectives, take the worst line back one step, and re-run."),
+          "Spending — drop the purchases that don't pay for themselves",
+          "the 'earns its keep' objective (each line's return per rush)"),
+        q("spend_2", "any", _paying_for_nothing,
+          "How do you judge whether the NEXT tier of a lean practice is worth "
+          "buying?",
+          ["Compare the EXTRA cost of that step against the EXTRA return it brings",
+            "Buy it — higher tiers are always leaner",
+            "Buy it if this rush made a profit",
+            "Buy it if it makes the shop look more professional"], 0,
+          ("Judge every improvement at the margin: what does the NEXT dollar buy? "
+           "👉 The **profit-impact test** prices each available step against your "
+           "current shop — most ladders give you nearly all the benefit in the "
+           "first, cheapest step."),
+          "Spending — judge each step at the margin, not by its name",
+          "the profit-impact test (Δ profit of each next step)"),
     ]
 
 
@@ -1930,7 +2276,8 @@ def _waste_damage(waste, cfg, res):
                     - order_distance(IDEAL_ORDER))
         return bt * 6.0 + extra * 0.9
     if waste == "motion":
-        return {"Disorganized": 8.0, "Basic": 3.0, "Full 5S": 0.0}[cfg.five_s]
+        return {"Disorganized": 8.0, "Basic": 3.0, "Full 5S": 0.0,
+                "Consultant 5S": 0.0}.get(cfg.five_s, 8.0)
     if waste == "overprocessing":
         return 10.0 if cfg.standard_level == 0 else 0.0
     if waste == "defects":
@@ -1960,7 +2307,7 @@ def _profit_by_waste(cfg, allowed):
     return out
 
 
-def coach_mc(cfg, res, diag, allowed, asked):
+def _coach_mc_base(cfg, res, diag, allowed, asked):
     """Pick ONE multiple-choice question. When several wastes are actionable, target
     the one whose counter-measure adds the MOST profit right now (so the coach points
     at the biggest-payoff move); fall back to whichever waste is hurting the Lean
@@ -2006,6 +2353,51 @@ def coach_mc(cfg, res, diag, allowed, asked):
     chosen = dict(next((q for q in any_qs if q["id"] not in asked), any_qs[0]))
     chosen["target_waste"] = None
     return chosen
+
+
+# Answers that sound decisive and cost real money, but are never the lean read of
+# an obstacle. Two of these are mixed into every coaching question, so no question
+# ever offers a single obviously-wrong option — the student has to reject spending
+# as a diagnosis, not just pick the least silly sentence.
+SPEND_DISTRACTORS = [
+    "Buy the top tier of the order-display system",
+    "Lease the robotic juicer to speed up blending",
+    "Hire two more baristas and add another blender",
+    "Run the loyalty promo push to bring in more customers",
+    "Order extra of every ingredient so you never run short",
+    "Pre-make a big batch of drinks so they're ready in advance",
+    "Bring in a consultant to re-audit the shop every month",
+    "Switch to premium organic fruit so drinks are better",
+    "Install a conveyor belt so nobody has to carry drinks",
+    "New uniforms and shopfront signage to lift the shop's image",
+]
+N_SPEND_DISTRACTORS = 2
+
+
+def coach_mc(cfg, res, diag, allowed, asked):
+    """The coaching question, plus two spend-your-way-out distractors so more than
+    one option on every question is a bad choice."""
+    q = None
+    # If the shop is currently paying for something that doesn't earn its keep,
+    # that is the obstacle worth coaching on — it blocks an objective and it is
+    # the lesson students most often miss.
+    if cached_wasted_spend(cfg):
+        _spend_qs = [x for x in _coach_bank(cfg, res)
+                     if str(x["id"]).startswith("spend_")]
+        if _spend_qs:
+            _fresh = [x for x in _spend_qs if x["id"] not in asked]
+            q = dict((_fresh or _spend_qs)[0])
+            q["target_waste"] = None
+    if q is None:
+        q = _coach_mc_base(cfg, res, diag, allowed, asked)
+    opts = list(q["options"])
+    pool = [d for d in SPEND_DISTRACTORS
+            if not any(d.lower() in o.lower() or o.lower() in d.lower()
+                       for o in opts)]
+    rng = _random.Random(sum(ord(c) for c in str(q["id"])))
+    rng.shuffle(pool)
+    q["options"] = opts + pool[:N_SPEND_DISTRACTORS]
+    return q
 
 
 # --------------------------------------------------------------------------
@@ -2352,7 +2744,7 @@ _completed = (_lr_res is not None and _lr_cfg is not None
 if not guided:
     plan = FREE_PLAY
 elif _completed:
-    plan = DONE_PLAN                      # all 3 objectives met — don't nag
+    plan = DONE_PLAN                      # all objectives met — don't nag
 elif rnd in ROUND_PLAN:
     plan = ROUND_PLAN[rnd]
 else:
@@ -2477,25 +2869,44 @@ if _res is not None:
             st.info(f"🧪 **You ran an experiment** (*“{_pred}”*) — result: {_fact}. "
                     "Every experiment teaches you something, win or lose.")
 
-    # ---------- progress toward the debrief: the THREE objectives ----------
+    # ---------- progress toward the debrief: the FOUR objectives ----------
     _obj = objectives_status(cfg_done, res)
     _done, _total, _items = _obj["done"], _obj["total"], _obj["items"]
-    _obj_met = sum([_obj["wastes_ok"], _obj["score_ok"], _obj["profit_ok"]])
+    _obj_met = sum([_obj["wastes_ok"], _obj["score_ok"], _obj["profit_ok"],
+                    _obj["spend_ok"]])
+    _wrows = _obj["waste_rows"]
     st.markdown(
-        f"**🎯 Objectives to complete the simulation ({_obj_met}/3 met)**  \n"
+        f"**🎯 Objectives to complete the simulation ({_obj_met}/4 met)**  \n"
         f"{'✅' if _obj['wastes_ok'] else '⬜'} All 7 wastes addressed — "
         f"**{_done}/{_total}**  \n"
         f"{'✅' if _obj['score_ok'] else '⬜'} Lean Score ≥ {LEAN_TARGET} — "
         f"**{res.lean_score:.0f}**  \n"
-        f"{'✅' if _obj['profit_ok'] else '⬜'} Running a profit (> $0) — "
-        f"**${res.profit:.0f}**")
-    st.progress(_obj_met / 3.0)
+        f"{'✅' if _obj['profit_ok'] else '⬜'} Running a profit (> \\$0) — "
+        f"**\\${res.profit:.0f}**  \n"
+        f"{'✅' if _obj['spend_ok'] else '⬜'} Every dollar you spend earns its "
+        f"keep — **{len(_wrows)}** purchase"
+        f"{' is' if len(_wrows) == 1 else 's are'} not paying for "
+        f"{'itself' if len(_wrows) == 1 else 'themselves'}")
+    st.progress(_obj_met / 4.0)
     if _obj["all_ok"]:
         st.caption("✅ All objectives met — the debrief is unlocked below.")
-    elif not _obj["wastes_ok"]:
-        with st.expander("Which wastes are still left?", expanded=True):
-            for nm, ok in _items:
-                st.markdown(f"{'✅' if ok else '⬜'} {nm}")
+    else:
+        if not _obj["wastes_ok"]:
+            with st.expander("Which wastes are still left?", expanded=True):
+                for nm, ok in _items:
+                    st.markdown(f"{'✅' if ok else '⬜'} {nm}")
+        if _wrows:
+            with st.expander("Which spending isn't earning its keep?",
+                             expanded=True):
+                st.caption("Each line re-runs your rush with **that one step "
+                           "undone** — everything else identical. A negative "
+                           "return means the shop makes MORE money without it. "
+                           "Drop it back a step, or spend the money where it "
+                           "does work.")
+                for r in sorted(_wrows, key=lambda x: x["d_profit"]):
+                    st.markdown(f"🔻 **{r['name']}** ({r['step']}) — costs "
+                                f"**\\${r['cost']:.0f}/rush**, returns "
+                                f"**{r['d_profit']:+.0f}\\$**")
 
     dc1, dc2 = st.columns([1.05, 1])
     with dc1:
@@ -2763,23 +3174,35 @@ with st.container():
 
     # 2. Transport  →  5S #2 Set in order
     if "transport" in dec_unlocked:
-        tcost = "~$1" if order_distance(C["order"]) < order_distance(list(SC["order"])) else "free"
+        _tbase = 1.0 if order_distance(C["order"]) < order_distance(list(SC["order"])) else 0.0
+        _tsum = _tbase + (sim.LEAN_COSTS["conveyor"] if C["conveyor"] else 0.0)
+        tcost = f"${_tsum:.0f}/rush" if _tsum else "free"
         with _dec("transport", "🚚 **Transport** — drinks carried around the shop",
                   "5S #2 Set in order", tcost):
             layout_editor()
+            st.divider()
+            C["conveyor"] = st.toggle(
+                f"🛝 Conveyor belt between stations (${sim.LEAN_COSTS['conveyor']:.0f}"
+                "/rush)", value=C["conveyor"])
+            st.caption("The equipment rep says a belt moves drinks between stations "
+                       "so nobody has to carry them — it cuts walking time by about "
+                       "45%, whatever order the stations are in.")
 
     # 3. Motion  →  5S #3 Shine
     if "motion" in dec_unlocked:
-        fcost = {"Disorganized": 0, "Basic": 3, "Full 5S": 6}[C["five_s"]]
+        fcost = sim.FIVE_S_COST[C["five_s"]]
         with _dec("motion", "🚶 **Motion** — workers hunting for tools & "
-                  "ingredients", "5S #3 Shine", f"${fcost}/rush"):
+                  "ingredients", "5S #3 Shine", f"${fcost:.0f}/rush"):
             st.caption("**Shine: clean & label.** A tidy, labeled station means no "
-                       "searching. Higher levels cost more upkeep.")
-            _fs = ["Disorganized", "Basic", "Full 5S"]
+                       "searching. Higher levels cost more upkeep — decide how far "
+                       "up the ladder is worth paying for.")
+            _fs = list(sim.FIVE_S_ORDER)
             C["five_s"] = st.selectbox(
                 "Clean & label level", _fs, index=_fs.index(C["five_s"]),
                 label_visibility="collapsed")
-            st.caption(f"Upkeep now: **${fcost}/rush**.")
+            fcost = sim.FIVE_S_COST[C["five_s"]]
+            st.caption(f"**{C['five_s']}** — {sim.FIVE_S_DESC[C['five_s']]}  ·  "
+                       f"**${fcost:.0f}/rush**.")
 
     # 4. Overprocessing  →  5S #4 Standardize
     if "overprocessing" in dec_unlocked:
@@ -2799,8 +3222,9 @@ with st.container():
 
     # 5. Inventory  →  5S #5 Sustain
     if "inventory" in dec_unlocked:
-        icost = f"${(3 if C['pull'] else 0) + (1 if C['fifo'] else 0)}/rush" \
-            if (C["pull"] or C["fifo"]) else "free"
+        _isum = ((3 if C["pull"] else 0) + (1 if C["fifo"] else 0)
+                 + (sim.LEAN_COSTS["safety_stock"] if C["safety_stock"] else 0))
+        icost = f"${_isum:.0f}/rush" if _isum else "free"
         with _dec("inventory", "📦 **Inventory** — stock sitting around going stale",
                   "5S #5 Sustain", icost):
             st.caption("Three ways to control inventory: **(a) one-piece flow** "
@@ -2813,6 +3237,12 @@ with st.container():
             C["fifo"] = st.toggle("FIFO rotation (use oldest stock first)",
                                   value=C["fifo"])
             C["pull"] = st.toggle("Pull replenishment (kanban)", value=C["pull"])
+            C["safety_stock"] = st.toggle(
+                f"Safety stock — order extra of everything, just in case "
+                f"(${sim.LEAN_COSTS['safety_stock']:.0f}/rush)",
+                value=C["safety_stock"])
+            st.caption("Your supplier offers a standing top-up order so you never "
+                       "run short of fruit mid-rush.")
 
     # 6. Defects  →  quality tools (visual signals)
     if "defects" in dec_unlocked:
@@ -2853,6 +3283,34 @@ with st.container():
                 st.caption(f"Total baristas: **{C['employees']}**")
             C["blenders"] = st.number_input("🌀 Blenders ($12/rush each)", 1, 4,
                                             C["blenders"])
+            st.caption(f"The bar comfortably fits **{sim.CROWD_FREE_STAFF} people**; "
+                       "past that they work around each other and every task takes "
+                       "a little longer.")
+
+    # ---- The rep's catalogue: paid extras that are NOT lean counter-measures ----
+    if dec_unlocked:
+        _buy_on = [nm for f, nm in EXTRA_BUYS
+                   if C.get(f) and f not in ("conveyor", "safety_stock")]
+        _shelf_cost = sum(
+            (sim.UPGRADE_COSTS.get(f, 0.0) if f != "premium_ingredients"
+             else sim.COSTS["premium_extra_per_drink"] * 40)
+            for f, _ in EXTRA_BUYS if C.get(f) and f in
+            ("promo_push", "robo_juicer", "staging_fridge", "signage",
+             "premium_ingredients"))
+        with st.expander(
+                "🛒 **Tempting upgrades** — the sales rep is in the shop again"
+                + (f"   ·   💲 ${_shelf_cost:.0f}/rush committed" if _buy_on
+                   else "   ·   💲 nothing bought"),
+                expanded=False):
+            st.caption("None of these is a lean counter-measure — they're things "
+                       "a shop *can* buy. Each shows its real price. Whether any of "
+                       "them earns that money back in **your** shop is exactly the "
+                       "judgement the last objective is testing. Use **Test the "
+                       "profit impact** below before you commit.")
+            for _f, _label, _price, _pitch in UPGRADE_SHELF:
+                C[_f] = st.toggle(f"{_label}  ·  {_price}", value=C.get(_f, False),
+                                  key=f"buy_{_f}")
+                st.caption(_pitch)
 
     # always show the workflow picture + the derived 5S board so the two
     # frameworks stay front-and-center
@@ -2876,10 +3334,7 @@ if st.session_state.last_result is not None and dec_unlocked:
                    "just previews them. Nothing here commits or advances the round.")
 
         def _plan_sig(c):
-            return (tuple(cfg_layout_order(c)), c.five_s, c.standard_level,
-                    c.visual_level, c.pull_replenishment, c.fifo_rotation,
-                    c.batch_size, c.premade, c.employees, c.blenders,
-                    c.assignment_mode)
+            return _spend_sig(c)
 
         # ---- dry-run: auto-computed whenever the plan changes (cached) ----
         chg = plan_changes(_cfgL, cfg)
@@ -2994,6 +3449,7 @@ def summarize(res, cfg):
     if cfg.premade > 0:
         decisions.append(f"premade×{cfg.premade}")
     decisions.append(f"{cfg.employees} staff/{cfg.blenders} blndr")
+    decisions += [nm for f, nm in EXTRA_BUYS if getattr(cfg, f)]
     return dict(round=st.session_state.round, lean_score=res.lean_score,
                 avg_cycle=res.avg_cycle, served=res.served,
                 arrivals=res.arrivals, defects=res.defects, waste=res.waste,
@@ -3024,8 +3480,9 @@ cfg_done = st.session_state.last_cfg
 
 if res is not None:
     hist = st.session_state.history
-    # the core is complete ONLY when all THREE objectives are met: every waste
-    # addressed, Lean Score high enough, and the shop running a profit. (The full
+    # the core is complete ONLY when all FOUR objectives are met: every waste
+    # addressed, Lean Score high enough, the shop running a profit, and every
+    # dollar of spending earning its keep. (The full
     # checklist with what's left is shown up in the CHECK panel.)
     _obj_done = objectives_status(cfg_done, res)
     _goal_reached = _obj_done["all_ok"]
