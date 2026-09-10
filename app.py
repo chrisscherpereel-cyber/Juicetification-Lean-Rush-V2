@@ -1480,6 +1480,29 @@ if store.enabled() and sid and not st.session_state.get("_restored"):
 C = st.session_state.cfg
 SC = st.session_state.scenario
 
+# Forward-compatibility: a student who signed in with progress saved before a new
+# decision existed has a config dict without that key. Backfill anything missing
+# from the baseline (and drop keys that no longer exist) so an old save never
+# crashes the app with a KeyError.
+def _migrate_cfg_dict(d, baseline):
+    """Fill in decision keys an older save predates, and clamp tier indexes."""
+    if not isinstance(d, dict):
+        return d
+    for k, v in baseline.items():
+        d.setdefault(k, v)
+    if d.get("five_s") not in sim.FIVE_S_ORDER:
+        d["five_s"] = "Disorganized"
+    d["standard_level"] = max(0, min(int(d.get("standard_level", 0) or 0),
+                                     len(sim.STANDARD_LEVELS) - 1))
+    d["visual_level"] = max(0, min(int(d.get("visual_level", 0) or 0),
+                                   len(sim.VISUAL_LEVELS) - 1))
+    return d
+
+
+_BASELINE_KEYS = _baseline_cfg(SC)
+_migrate_cfg_dict(C, _BASELINE_KEYS)
+_migrate_cfg_dict(st.session_state.get("last_cdict"), _BASELINE_KEYS)
+
 
 def cfg_from_state(s):
     return sim.Config(
@@ -3175,7 +3198,7 @@ with st.container():
     # 2. Transport  →  5S #2 Set in order
     if "transport" in dec_unlocked:
         _tbase = 1.0 if order_distance(C["order"]) < order_distance(list(SC["order"])) else 0.0
-        _tsum = _tbase + (sim.LEAN_COSTS["conveyor"] if C["conveyor"] else 0.0)
+        _tsum = _tbase + (sim.LEAN_COSTS["conveyor"] if C.get("conveyor") else 0.0)
         tcost = f"${_tsum:.0f}/rush" if _tsum else "free"
         with _dec("transport", "🚚 **Transport** — drinks carried around the shop",
                   "5S #2 Set in order", tcost):
@@ -3183,14 +3206,14 @@ with st.container():
             st.divider()
             C["conveyor"] = st.toggle(
                 f"🛝 Conveyor belt between stations (${sim.LEAN_COSTS['conveyor']:.0f}"
-                "/rush)", value=C["conveyor"])
+                "/rush)", value=bool(C.get("conveyor")))
             st.caption("The equipment rep says a belt moves drinks between stations "
                        "so nobody has to carry them — it cuts walking time by about "
                        "45%, whatever order the stations are in.")
 
     # 3. Motion  →  5S #3 Shine
     if "motion" in dec_unlocked:
-        fcost = sim.FIVE_S_COST[C["five_s"]]
+        fcost = sim.FIVE_S_COST.get(C["five_s"], 0.0)
         with _dec("motion", "🚶 **Motion** — workers hunting for tools & "
                   "ingredients", "5S #3 Shine", f"${fcost:.0f}/rush"):
             st.caption("**Shine: clean & label.** A tidy, labeled station means no "
@@ -3200,7 +3223,7 @@ with st.container():
             C["five_s"] = st.selectbox(
                 "Clean & label level", _fs, index=_fs.index(C["five_s"]),
                 label_visibility="collapsed")
-            fcost = sim.FIVE_S_COST[C["five_s"]]
+            fcost = sim.FIVE_S_COST.get(C["five_s"], 0.0)
             st.caption(f"**{C['five_s']}** — {sim.FIVE_S_DESC[C['five_s']]}  ·  "
                        f"**${fcost:.0f}/rush**.")
 
@@ -3223,7 +3246,7 @@ with st.container():
     # 5. Inventory  →  5S #5 Sustain
     if "inventory" in dec_unlocked:
         _isum = ((3 if C["pull"] else 0) + (1 if C["fifo"] else 0)
-                 + (sim.LEAN_COSTS["safety_stock"] if C["safety_stock"] else 0))
+                 + (sim.LEAN_COSTS["safety_stock"] if C.get("safety_stock") else 0))
         icost = f"${_isum:.0f}/rush" if _isum else "free"
         with _dec("inventory", "📦 **Inventory** — stock sitting around going stale",
                   "5S #5 Sustain", icost):
@@ -3240,7 +3263,7 @@ with st.container():
             C["safety_stock"] = st.toggle(
                 f"Safety stock — order extra of everything, just in case "
                 f"(${sim.LEAN_COSTS['safety_stock']:.0f}/rush)",
-                value=C["safety_stock"])
+                value=bool(C.get("safety_stock")))
             st.caption("Your supplier offers a standing top-up order so you never "
                        "run short of fruit mid-rush.")
 
