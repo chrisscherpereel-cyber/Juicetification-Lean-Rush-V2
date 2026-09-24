@@ -1094,7 +1094,7 @@ ROUND_PLAN = {
 # Guided rounds beyond 4 when mastery isn't yet 7/7 — keep every lever open and
 # point the student at what's still unaddressed (no "core done" message yet).
 CONTINUE = {"unlock": GROUPS, "concept": "Kaizen — finish the job",
-            "title": "Keep improving — address all 7 wastes",
+            "title": "Keep improving — address every waste worth addressing",
             "focus": "A few wastes still need a counter-measure. Use the coach and "
                      "the 7-wastes dashboard to find what's left, then fix it.",
             "why": "The core is complete only when every one of the 7 wastes has a "
@@ -1108,7 +1108,8 @@ FREE_PLAY = {"unlock": GROUPS, "concept": "Kaizen",
 # finished student to "keep improving."
 DONE_PLAN = {"unlock": GROUPS, "concept": "Kaizen — complete",
              "title": "✅ Objectives met — the core simulation is complete",
-             "focus": "You've addressed all 7 wastes with a high Lean Score, a "
+             "focus": "You've addressed every waste worth addressing, with a "
+                      "high Lean Score, a "
                       "healthy profit, and no spending that fails to pay for "
                       "itself. Scroll down to your **debrief**; keep "
                       "experimenting here if you'd like.",
@@ -1116,41 +1117,107 @@ DONE_PLAN = {"unlock": GROUPS, "concept": "Kaizen — complete",
                     "and spending that earns its keep."}
 
 
+# The counter-measures that would actually TICK each waste, as changes to the
+# current shop. Used to ask the only fair question there is: in THIS shop, is
+# there anything here worth doing?
+def _qualifying_moves(cfg, waste):
+    if waste == "transport":
+        return ([dict(layout=coords_from_order(IDEAL_ORDER))]
+                if backtracks(cfg_layout_order(cfg)) else [])
+    if waste == "overproduction":
+        return [dict(batch_size=1, premade=0)]
+    if waste == "motion":
+        i = FIVE_S_ORDER.index(cfg.five_s) if cfg.five_s in FIVE_S_ORDER else 0
+        return [dict(five_s=FIVE_S_ORDER[i + 1])] if i + 1 < len(FIVE_S_ORDER) else []
+    if waste == "overprocessing":
+        return ([dict(standard_level=max(1, cfg.standard_level))]
+                if cfg.standard_level < 1 else [])
+    if waste == "inventory":
+        return [dict(batch_size=1, premade=0), dict(fifo_rotation=True),
+                dict(pull_replenishment=True)]
+    if waste == "defects":
+        return [dict(visual_level=max(1, cfg.visual_level)),
+                dict(standard_level=max(2, cfg.standard_level))]
+    if waste == "waiting":
+        return [dict(blenders=cfg.blenders + 1), dict(employees=cfg.employees + 1)]
+    return []
+
+
+_WORTH_CACHE = {}
+
+
+def worth_addressing(cfg, waste):
+    """Is there a counter-measure for this waste that would actually pay for itself
+    in THIS shop? Returns (worth_it, best_gain).
+
+    This is what keeps the 'address every waste' objective honest against the
+    'every dollar earns its keep' objective. Some shops genuinely have a waste
+    whose only fix costs more than it returns — a quiet shop where tidying the bar
+    saves time nobody is waiting on, say. Demanding that counter-measure anyway
+    would force the student to buy something the spending objective then flags:
+    an unwinnable pair of rules. Lean's real answer is that you do NOT spend there,
+    so a waste with nothing worth doing counts as settled."""
+    key = (_spend_sig(cfg), waste)
+    if key not in _WORTH_CACHE:
+        if len(_WORTH_CACHE) > 400:
+            _WORTH_CACHE.clear()
+        best = 0.0
+        try:
+            base = run_sim(_clone(cfg), base_seed=ANALYSIS_SEED)
+            for kw in _qualifying_moves(cfg, waste):
+                got = run_sim(_clone(cfg, **kw), base_seed=ANALYSIS_SEED)
+                best = max(best, got.profit - base.profit)
+        except Exception:
+            return True, 0.0            # can't tell -> ask for the counter-measure
+        _WORTH_CACHE[key] = (best > SPEND_TOLERANCE, best)
+    return _WORTH_CACHE[key]
+
+
 def lean_level(cfg, res, spend_bad=None):
-    """A waste is 'addressed' when the student has the right counter-measure DECISION
-    in place — so the count reflects the choices they actually made this round, not a
-    lucky green outcome. Every counter-measure is cheap and achievable, so 7/7 is
-    always reachable. (Waiting is the one exception: it also counts when walkouts are
-    already low, because adding capacity you don't need is not lean.) Returns
-    (done, total, items)."""
-    # Capacity only counts as a counter-measure when the LAST unit you bought is
+    """Every waste that is WORTH addressing in this shop has been addressed.
+
+    A waste ticks when the student has its counter-measure in place — or when
+    nothing available for that waste would pay for itself, in which case leaving
+    it alone IS the lean decision and the item ticks as 'nothing worth doing'.
+    Returns (done, total, items), items being (label, ok, note)."""
+    # Capacity only counts as a counter-measure when the LAST unit bought is
     # actually earning its money (see spend_audit) -- capacity bought "just in
     # case" is the Waiting waste dressed up as a fix.
     _bad = {r["name"] for r in (spend_bad or [])}
     capacity_added = cfg.employees > 3 or cfg.blenders > 1
     capacity_pays = capacity_added and not ({"Baristas", "Blenders"} & _bad)
-    items = [
-        ("Transport — stations lined up in process order",
+    decided = [
+        ("transport", "Transport — stations lined up in process order",
          backtracks(cfg_layout_order(cfg)) == 0),
-        ("Overproduction — one-piece flow (batch 1, few/no pre-made)",
+        ("overproduction", "Overproduction — one-piece flow (batch 1, few/no pre-made)",
          cfg.batch_size == 1 and cfg.premade <= 3),
-        ("Motion — clean & labelled stations (5S)",
+        ("motion", "Motion — clean & labelled stations (5S)",
          cfg.five_s != "Disorganized"),
-        ("Overprocessing — standard work in place",
+        ("overprocessing", "Overprocessing — standard work in place",
          cfg.standard_level >= 1),
-        ("Inventory — one-piece flow, pull replenishment, or FIFO rotation",
+        ("inventory", "Inventory — one-piece flow, pull replenishment, or FIFO rotation",
          cfg.pull_replenishment or cfg.fifo_rotation
          or (cfg.batch_size == 1 and cfg.premade == 0)),
-        ("Defects — standard recipes and/or visual signals",
+        ("defects", "Defects — standard recipes and/or visual signals",
          cfg.visual_level >= 1 or cfg.standard_level >= 2),
         # Buying capacity is NOT the counter-measure — relieving the constraint is.
-        # This ticks when few customers actually walk out, whether you got there by
-        # speeding the line up or by adding capacity exactly where it was needed.
-        ("Waiting — bottleneck relieved (few walkouts, or capacity added "
+        ("waiting", "Waiting — bottleneck relieved (few walkouts, or capacity added "
          "where it pays for itself)",
          res.abandon_pct < 15 or capacity_pays),
     ]
-    done = sum(1 for _, x in items if x)
+    items = []
+    for key, label, is_done in decided:
+        if is_done:
+            items.append((label, True, ""))
+            continue
+        worth, gain = worth_addressing(cfg, key)
+        if worth:
+            items.append((label, False, ""))
+        else:
+            items.append((label, True,
+                          "nothing here pays for itself in this shop — leaving it "
+                          "alone is the lean call"))
+    done = sum(1 for _, ok, _ in items if ok)
     return done, len(items), items
 
 
@@ -3204,8 +3271,8 @@ if _res is not None:
     _wrows = _obj["waste_rows"]
     st.markdown(
         f"**🎯 Objectives to complete the simulation ({_obj_met}/4 met)**  \n"
-        f"{'✅' if _obj['wastes_ok'] else '⬜'} All 7 wastes addressed — "
-        f"**{_done}/{_total}**  \n"
+        f"{'✅' if _obj['wastes_ok'] else '⬜'} Every waste worth addressing is "
+        f"addressed — **{_done}/{_total}**  \n"
         f"{'✅' if _obj['score_ok'] else '⬜'} Lean Score ≥ {LEAN_TARGET} — "
         f"**{res.lean_score:.0f}**  \n"
         f"{'✅' if _obj['profit_ok'] else '⬜'} Running a profit (> \\$0) — "
@@ -3220,8 +3287,12 @@ if _res is not None:
     else:
         if not _obj["wastes_ok"]:
             with st.expander("Which wastes are still left?", expanded=True):
-                for nm, ok in _items:
-                    st.markdown(f"{'✅' if ok else '⬜'} {nm}")
+                st.caption("A waste ticks when its counter-measure is in place — "
+                           "**or** when nothing available for it would pay for "
+                           "itself here. Not spending is a real lean decision.")
+                for nm, ok, note in _items:
+                    st.markdown(f"{'✅' if ok else '⬜'} {nm}"
+                                + (f"  \n&nbsp;&nbsp;&nbsp;*{note}*" if note else ""))
         if _wrows:
             with st.expander("Which spending isn't earning its keep?",
                              expanded=True):

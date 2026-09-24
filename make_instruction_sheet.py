@@ -98,7 +98,7 @@ for i, (k, d) in enumerate([
 # --------------------------------------------------------- 2. your goal ---
 section(0.700, 2, "You finish when all four are ticked")
 
-goals = [("All 7 wastes fixed", "each one countered"),
+goals = [("Wastes worth fixing", "countered where it pays"),
          ("Lean Score  ≥ 70", "quality, speed, flow"),
          ("Profit  > $0", "the shop makes money"),
          ("Spending pays off", "drop what doesn't pay")]

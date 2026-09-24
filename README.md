@@ -106,7 +106,9 @@ monotonically along the improvement path, so every genuine change is visible.
 
 The core simulation is complete only when **all three** are true:
 
-- ✅ **All 7 wastes addressed** — each has its counter-measure decision in place
+- ✅ **Every waste worth addressing is addressed** — each has its counter-measure
+  decision in place, *or* nothing available for that waste would pay for itself in
+  this shop, in which case leaving it alone is itself the lean decision
 - ✅ **Lean Score ≥ 70**
 - ✅ **Running a profit** (> $0)
 
