@@ -1531,16 +1531,34 @@ def cfg_from_state(s):
 # from the saved decision snapshot + seed, BEFORE the CHECK/ACT panel is rendered
 # below, so the coach question reappears and the student can answer it and advance.
 # (Previously the panel was skipped and the DO button stayed locked — "stuck".)
-if (st.session_state.get("last_result") is None
-        and st.session_state.get("last_cdict") is not None
-        and st.session_state.get("history")):
-    try:
-        _lc = cfg_from_state(st.session_state["last_cdict"])
-        st.session_state.last_cfg = _lc
-        st.session_state.last_result = run_sim(
-            _lc, base_seed=st.session_state.get("last_seed", 1000))
-    except Exception:
-        pass
+def recover_last_result():
+    """Put the last rush back in memory after a refresh, an idle reconnect or a
+    signed-in return. Tries the saved decision snapshot first, then the live
+    config as a fallback, so a save written before `last_cdict` existed (or one
+    that fails to load) still gets the student a CHECK/ACT panel. Returns True if
+    a result is available afterwards."""
+    if st.session_state.get("last_result") is not None:
+        return True
+    hist = st.session_state.get("history") or []
+    if not hist:
+        return False                      # nothing has been run yet: normal
+    seed = st.session_state.get("last_seed")
+    if not isinstance(seed, int):
+        seed = 1000 + int(hist[-1].get("round", 1))
+    for source in (st.session_state.get("last_cdict"), st.session_state.get("cfg")):
+        if not isinstance(source, dict):
+            continue
+        try:
+            _lc = cfg_from_state(_migrate_cfg_dict(dict(source), _BASELINE_KEYS))
+            st.session_state.last_cfg = _lc
+            st.session_state.last_result = run_sim(_lc, base_seed=seed)
+            st.session_state["last_cdict"] = dict(source)
+            st.session_state["last_seed"] = seed
+            return True
+        except Exception:
+            continue
+    return False
+
 
 
 # --------------------------------------------------------------------------
@@ -1903,6 +1921,13 @@ def run_sim(cfg, base_seed=1234):
         return _sim_cached(cfg_signature(cfg), base_seed, cfg)
     except Exception:
         return sim.run_simulation(cfg, base_seed=base_seed)
+
+
+# Restore the last rush NOW — after run_sim exists (recover_last_result calls it)
+# and before the sidebar, which decides from it whether the coach's question is
+# on screen. RESULT_MISSING is True only when a rush was run and could not be
+# rebuilt; nothing is ever gated on a question that isn't showing.
+RESULT_MISSING = bool(st.session_state.get("history")) and not recover_last_result()
 
 # Everything the shop can switch ON that is not a tiered lean level: the flag on
 # Config, the name students see, and the state key that drives it.
@@ -2846,10 +2871,18 @@ with st.sidebar:
     # ---- RUN button lives here, big and obvious; flashes when ready ----
     _lr = st.session_state.history[-1]["round"] if st.session_state.history else None
     _ck = f"coachmc_{_lr}" if _lr else None
-    need_coach = bool(_lr) and st.session_state.get(_ck) is None
-    # you must also COMMIT a plan (predict) before you can run the next rush
+    # Only gate on the coach's question when that question is actually ON SCREEN.
+    # If the last rush could not be restored there is no question to answer, so
+    # gating would be a dead end — let the student run the next round instead.
+    _coach_on_screen = st.session_state.get("last_result") is not None
+    need_coach = (bool(_lr) and _coach_on_screen
+                  and st.session_state.get(_ck) is None)
+    # you must also COMMIT a plan (predict) before you can run the next rush —
+    # again, only while that commit widget is actually on screen (it lives in the
+    # PLAN panel, which is only drawn when the last rush is available).
     _pck = f"plancommit_{st.session_state.round}"
-    need_plan = bool(_lr) and st.session_state.get(_pck) is None
+    need_plan = (bool(_lr) and _coach_on_screen
+                 and st.session_state.get(_pck) is None)
     need_run = need_coach or need_plan
     if not need_run:
         st.markdown(
@@ -2864,10 +2897,56 @@ with st.sidebar:
     if need_coach:
         st.caption("🔒 Step 1: **answer the coach** at the top (Act on your result).")
         jr_jump_button("⬆️ Go to the coach's question", height=56)
+    elif RESULT_MISSING:
+        st.caption("↩︎ Your last rush couldn't be restored (the page was refreshed "
+                   "or reconnected). Your rounds and answers are safe — press "
+                   "**DO** to run the next round and the coach comes back.")
     elif need_plan:
         st.caption("🔒 Step 2: **make & commit your plan** on the right, then run.")
     else:
         st.caption("✅ Plan committed — press **DO** to run the rush.")
+
+    # ---- Report & progress: ALWAYS here, whatever else the page is doing ----
+    # This used to live only in an expander at the very bottom of the page, where
+    # it was easy to miss and could be pushed around by the debrief. The sidebar
+    # renders before the main content, so this is reachable at every moment.
+    st.divider()
+    with st.expander("📄 **Report & progress**",
+                     expanded=bool(st.session_state.get("history"))):
+        _rs = report_status()
+        st.markdown(
+            f"{'✅' if _rs['rounds'] else '⬜'} Rounds played — **{_rs['rounds']}**  \n"
+            f"{'✅' if _rs['objectives_ok'] else '⬜'} All four objectives met  \n"
+            f"{'✅' if _rs['reflections'] >= 4 else '⬜'} Written reflections — "
+            f"**{_rs['reflections']}/4**  \n"
+            f"{'✅' if _rs['quiz'] >= _rs['quiz_total'] else '⬜'} Knowledge check — "
+            f"**{_rs['quiz']}/{_rs['quiz_total']}**  \n"
+            f"{'✅' if (st.session_state.get('student') or '').strip() else '⬜'} "
+            "Name / student ID entered")
+        if _rs["complete"]:
+            st.success("Your report will be marked **COMPLETE**.")
+        else:
+            st.warning("Your report will be marked **INCOMPLETE** — you can still "
+                       "generate and submit it.")
+        if not _rs["rounds"]:
+            st.caption("Run at least one rush first.")
+        else:
+            if st.button("📄 Generate report", use_container_width=True,
+                         key="gen_report_side"):
+                with st.spinner("Building your PDF report…"):
+                    st.session_state["report_pdf"] = build_report_pdf()
+                    st.session_state["report_complete"] = _rs["complete"]
+            if st.session_state.get("report_pdf"):
+                _safe = (st.session_state.student or "student").replace(" ", "_")
+                _tag = "" if st.session_state.get("report_complete") else "_INCOMPLETE"
+                st.download_button(
+                    "⬇️ Download your report",
+                    data=st.session_state["report_pdf"],
+                    file_name=f"juicetification_{_safe}_sc{SC['sid']}{_tag}.pdf",
+                    mime="application/pdf", use_container_width=True,
+                    key="dl_report_side")
+                st.caption("Generated just now. Click **Generate report** again "
+                           "after you answer more, to refresh it.")
 
     # PDCA tracker — highlights the phase for the section you're scrolled to
     import streamlit.components.v1 as _components
@@ -3045,6 +3124,22 @@ _focus = set()
 # ======================================================================
 _res = st.session_state.last_result
 _cfgd = st.session_state.last_cfg
+if _res is None and RESULT_MISSING:
+    # A rush was run but its result is gone (refresh / reconnect / restored save
+    # from an older version). Say so plainly and give a way forward — this is the
+    # state that used to look like "the coach's question disappeared".
+    with st.container(border=True):
+        st.warning("↩︎ **Your last rush couldn't be restored.** The page was "
+                   "refreshed or reconnected, so the CHECK panel and the coach's "
+                   "question for that round aren't available.")
+        st.markdown("**Nothing is lost:** your rounds, decisions and every answer "
+                    "you've given are still recorded and still go on your report. "
+                    "Your decisions below are exactly where you left them.")
+        st.markdown("▶️ Press **DO — run the rush** in the sidebar to run the next "
+                    "round; the result panel and a fresh coach's question come "
+                    "back with it.")
+        st.caption("You can also generate your report from **Report & progress** "
+                   "in the sidebar at any time.")
 if _res is not None:
     res = _res
     cfg_done = _cfgd
@@ -3958,13 +4053,24 @@ with st.expander("📄 Progress report — download for your LMS", expanded=Fals
                 + "\n".join(f"- {m}" for m in _rs["missing"]))
         safe = (st.session_state.student or "student").replace(" ", "_")
         _tag = "" if _rs["complete"] else "_INCOMPLETE"
-        st.download_button(
-            ("⬇️  Download PDF report" if _rs["complete"]
-             else "⬇️  Download PDF report (marked incomplete)"),
-            data=build_report_pdf(),
-            file_name=f"justification_{safe}_sc{SC['sid']}{_tag}.pdf",
-            mime="application/pdf", use_container_width=True,
-            type="primary")
+        # Build on demand, not on every rerun: assembling the PDF costs about a
+        # quarter-second of server time, which is far more than a whole click
+        # otherwise costs, and it was being paid whether or not anyone downloaded.
+        if st.button("📄 Generate report", use_container_width=True,
+                     type="primary", key="gen_report_main"):
+            with st.spinner("Building your PDF report…"):
+                st.session_state["report_pdf"] = build_report_pdf()
+                st.session_state["report_complete"] = _rs["complete"]
+        if st.session_state.get("report_pdf"):
+            st.download_button(
+                ("⬇️  Download PDF report" if st.session_state.get("report_complete")
+                 else "⬇️  Download PDF report (marked incomplete)"),
+                data=st.session_state["report_pdf"],
+                file_name=f"juicetification_{safe}_sc{SC['sid']}{_tag}.pdf",
+                mime="application/pdf", use_container_width=True,
+                key="dl_report_main")
+        else:
+            st.caption("Press **Generate report** to build your PDF.")
         st.caption("A ready-to-submit PDF with your scenario, round-by-round "
                    "results, decisions, tested options, reflections, and knowledge "
                    "check.")
