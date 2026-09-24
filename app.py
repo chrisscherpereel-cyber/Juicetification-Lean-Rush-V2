@@ -13,6 +13,7 @@ import json
 import math
 import random
 import statistics
+import dataclasses
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Tuple
 
@@ -1537,7 +1538,7 @@ if (st.session_state.get("last_result") is None
     try:
         _lc = cfg_from_state(st.session_state["last_cdict"])
         st.session_state.last_cfg = _lc
-        st.session_state.last_result = sim.run_simulation(
+        st.session_state.last_result = run_sim(
             _lc, base_seed=st.session_state.get("last_seed", 1000))
     except Exception:
         pass
@@ -1547,7 +1548,46 @@ if (st.session_state.get("last_result") is None
 # Visuals.  Principle: figures hold ONLY short labels that fit inside their
 # shapes; every sentence of explanation is rendered as Streamlit text beneath
 # the image, so text can never overlap the graphics.
+#
+# PERFORMANCE: drawing these is by far the most expensive thing the app does —
+# far more than the simulation itself — and Streamlit re-runs the whole script
+# on every click, so a class of 30 students all redrawing the same pictures is
+# what makes the app crawl. So every figure is built with the thread-safe
+# object API (no pyplot global figure registry, nothing to leak), rendered to
+# PNG bytes ONCE, and cached on the inputs that actually determine the picture.
+# Two students with the same shop layout share one cached image, and clicking a
+# radio button re-serves the bytes instead of redrawing anything.
 # --------------------------------------------------------------------------
+import io as _io
+from matplotlib.figure import Figure as _Figure
+from matplotlib.backends.backend_agg import FigureCanvasAgg as _Canvas
+
+FIG_CACHE_TTL = 3600          # an hour is longer than any class session
+FIG_DPI = 110
+
+
+def _new_fig(figsize):
+    """A standalone figure + axes, with no pyplot global state behind it."""
+    fig = _Figure(figsize=figsize)
+    _Canvas(fig)
+    return fig, fig.add_subplot(111)
+
+
+def _to_png(fig):
+    buf = _io.BytesIO()
+    fig.savefig(buf, format="png", dpi=FIG_DPI, bbox_inches="tight")
+    return buf.getvalue()
+
+
+def show_png(png, **kw):
+    """Render cached image bytes where st.pyplot(fig) used to be. Newer Streamlit
+    wants width="stretch"; older builds only know use_container_width."""
+    try:
+        st.image(png, width="stretch", **kw)
+    except TypeError:
+        st.image(png, use_container_width=True, **kw)
+
+
 def _tile(ax, x, y, s, w=0.66, h=0.52):
     ax.add_patch(FancyBboxPatch((x - w / 2, y - h / 2), w, h,
                  boxstyle="round,pad=0.02,rounding_size=0.1", linewidth=1.4,
@@ -1571,7 +1611,7 @@ def flow_fig(order):
     the blocks and backtrack (red) arrows arcing BELOW — no overlap with tiles."""
     xpos = {s: i for i, s in enumerate(order)}
     n = len(order)
-    fig, ax = plt.subplots(figsize=(7.4, 3.3))
+    fig, ax = _new_fig((7.4, 3.3))
     ax.set_xlim(-0.7, n - 0.3); ax.set_ylim(-1.85, 1.7); ax.axis("off")
     # arrows first (zorder 1) so the tiles (zorder 2) sit cleanly on top. Both
     # arc AWAY from the tiles: forward (green) bulges up above the blocks,
@@ -1605,33 +1645,37 @@ def _cup(ax, x, y, color, w=0.20, h=0.15):
 
 def inventory_map_fig(order, res, cfg):
     """Shows WHERE stock piles up: prep at ingredients, WIP mid-line, made-ahead
-    at pickup, and waiting customers at the counter."""
+    at pickup, and waiting customers at the counter. The picture depends on only
+    a handful of whole numbers, so it is drawn from those (and cached on them)."""
+    return _inventory_map_draw(
+        tuple(order),
+        0 if cfg.pull_replenishment else 2 + (cfg.batch_size - 1),
+        int(round(res.avg_wip)), int(cfg.premade), int(round(res.peak_queue)),
+        round(min(1.0, res.abandon_pct / 45.0), 2))
+
+
+def _inventory_map_draw(order, prep, wip, pm, npk, stress):
     xpos = {s: i for i, s in enumerate(order)}
     n = len(order)
-    fig, ax = plt.subplots(figsize=(7.4, 4.0))
+    fig, ax = _new_fig((7.4, 4.0))
     ax.set_xlim(-0.7, n - 0.3); ax.set_ylim(-2.1, 2.3); ax.axis("off")
     for s, x in xpos.items():
         _tile(ax, x, 0.0, s)
 
-    prep = 0 if cfg.pull_replenishment else 2 + (cfg.batch_size - 1)
     for s in ("Cups", "Fruit", "Ice"):
         x = xpos[s]
         for j in range(min(int(prep), 8)):
             _cup(ax, x, 0.42 + j * 0.19, "#a8dadc")      # prep stock (blue) above
 
-    wip = int(round(res.avg_wip))
     mids = ["Blender", "Finish"]
     for k in range(min(wip, 12)):
         x = xpos[mids[k % 2]]
         _cup(ax, x, -0.42 - (k // 2) * 0.19, "#ffb703")  # WIP (amber) below
 
-    pm = int(cfg.premade)
     xp = xpos["Pickup"]
     for j in range(min(pm, 10)):
         _cup(ax, xp, 0.42 + j * 0.19, "#e76f51")         # made-ahead (red) above
 
-    npk = int(round(res.peak_queue))
-    stress = min(1.0, res.abandon_pct / 45.0)
     ccol = plt.cm.RdYlGn_r(0.15 + 0.7 * stress)
     for i in range(min(npk, 15)):
         ax.scatter([xp - 0.28 + (i % 3) * 0.28], [-0.55 - (i // 3) * 0.17],
@@ -1668,12 +1712,15 @@ def five_s_status(cfg):
 
 def five_s_fig(cfg):
     """5S scoreboard driven by the student's actual decisions (not a slider)."""
-    status = five_s_status(cfg)
-    done_n = sum(1 for _, d, _, _ in status if d)
+    return _five_s_draw(tuple((nm, bool(d)) for nm, d, _, _ in five_s_status(cfg)))
+
+
+def _five_s_draw(status):
+    done_n = sum(1 for _, d in status if d)
     tags = ["1S", "2S", "3S", "4S", "5S"]
-    fig, ax = plt.subplots(figsize=(7.2, 1.6))
+    fig, ax = _new_fig((7.2, 1.6))
     ax.set_xlim(-0.5, 5); ax.set_ylim(-0.2, 1.2); ax.axis("off")
-    for i, (name, done, _, _) in enumerate(status):
+    for i, (name, done) in enumerate(status):
         ax.add_patch(FancyBboxPatch((i - 0.42, 0.05), 0.84, 0.9,
                      boxstyle="round,pad=0.02,rounding_size=0.08", linewidth=1.3,
                      edgecolor="#264653",
@@ -1691,7 +1738,7 @@ def five_s_fig(cfg):
 def render_5s(cfg):
     """Show the 5S board + a line per S: status, what's done, which decision."""
     import streamlit as _st
-    _st.pyplot(five_s_fig(cfg))
+    show_five_s(cfg)
     for name, done, decision, doing in five_s_status(cfg):
         mark = "✅" if done else "⬜"
         _st.markdown(f"{mark} **{name}** — {doing}  \n"
@@ -1702,7 +1749,7 @@ def seven_waste_fig(diag):
     """Visual dashboard of the seven wastes as a colored 4x2 tile grid."""
     col = {"green": "#2a9d8f", "amber": "#e9c46a", "red": "#e76f51"}
     word = {"green": "ok", "amber": "watch", "red": "problem"}
-    fig, ax = plt.subplots(figsize=(7.4, 2.7))
+    fig, ax = _new_fig((7.4, 2.7))
     ax.set_xlim(-0.5, 4); ax.set_ylim(-2.4, 0.7); ax.axis("off")
     for i, dgn in enumerate(diag):
         r, c = i // 4, i % 4
@@ -1720,7 +1767,7 @@ def seven_waste_fig(diag):
 
 
 def cycle_hist(cts, target=120):
-    fig, ax = plt.subplots(figsize=(5.2, 2.7))
+    fig, ax = _new_fig((5.2, 2.7))
     if cts:
         ax.hist(cts, bins=20, color="#8ecae6", edgecolor="#264653")
         m = sum(cts) / len(cts)
@@ -1733,7 +1780,7 @@ def cycle_hist(cts, target=120):
 
 
 def impact_effort_chart(rows):
-    fig, ax = plt.subplots(figsize=(5.8, 3.6))
+    fig, ax = _new_fig((5.8, 3.6))
     ax.axhline(0, color="#999", lw=1)
     for r in rows:
         worth = r["d_profit"] >= 1.0
@@ -1749,11 +1796,114 @@ def impact_effort_chart(rows):
     return fig
 
 
+# ---- cached PNGs -----------------------------------------------------------
+# Each wrapper takes ONLY the values the picture depends on, so the cache key is
+# small, hashable and shared between every student whose shop looks the same.
+# st.cache_data is process-wide, which is exactly what we want here: one drawing
+# of a given flow diagram serves the whole class for the rest of the session.
+_FIG_CACHE = dict(show_spinner=False, ttl=FIG_CACHE_TTL, max_entries=256)
+
+
+@st.cache_data(**_FIG_CACHE)
+def flow_png(order):
+    return _to_png(flow_fig(list(order)))
+
+
+@st.cache_data(**_FIG_CACHE)
+def inventory_map_png(order, prep, wip, pm, npk, stress):
+    return _to_png(_inventory_map_draw(order, prep, wip, pm, npk, stress))
+
+
+@st.cache_data(**_FIG_CACHE)
+def five_s_png(status):
+    return _to_png(_five_s_draw(status))
+
+
+@st.cache_data(**_FIG_CACHE)
+def seven_waste_png(flags):
+    return _to_png(seven_waste_fig([{"waste": w, "flag": f} for w, f in flags]))
+
+
+@st.cache_data(**_FIG_CACHE)
+def cycle_hist_png(cts, target=120):
+    return _to_png(cycle_hist(list(cts), target))
+
+
+@st.cache_data(**_FIG_CACHE)
+def impact_effort_png(rows):
+    return _to_png(impact_effort_chart(
+        [{"short": s, "added_cost": c, "d_profit": p} for s, c, p in rows]))
+
+
+# ---- the call sites use these: same pictures, drawn at most once -----------
+def show_flow(order):
+    show_png(flow_png(tuple(order)))
+
+
+def show_inventory_map(order, res, cfg):
+    show_png(inventory_map_png(
+        tuple(order),
+        0 if cfg.pull_replenishment else 2 + (cfg.batch_size - 1),
+        int(round(res.avg_wip)), int(cfg.premade), int(round(res.peak_queue)),
+        round(min(1.0, res.abandon_pct / 45.0), 2)))
+
+
+def show_five_s(cfg):
+    show_png(five_s_png(tuple((nm, bool(d)) for nm, d, _, _ in five_s_status(cfg))))
+
+
+def show_seven_wastes(diag):
+    show_png(seven_waste_png(tuple((d["waste"], d["flag"]) for d in diag)))
+
+
+def show_cycle_hist(cts, target=120):
+    show_png(cycle_hist_png(tuple(round(c, 1) for c in cts), target))
+
+
+def show_impact_effort(rows):
+    show_png(impact_effort_png(
+        tuple((r["short"], round(r["added_cost"], 2), round(r["d_profit"], 2))
+              for r in rows)))
+
+
 # --------------------------------------------------------------------------
 # "what should I do next" analyzer
 # --------------------------------------------------------------------------
 ANALYSIS_SEED = 777
 ANALYSIS_REPS = 6
+
+
+# --------------------------------------------------------------------------
+# Shared simulation cache
+# --------------------------------------------------------------------------
+# The simulation is deterministic: the same shop and the same seed always give
+# the same rush. So results are cached process-wide on an EXHAUSTIVE signature
+# of the configuration (built from the dataclass fields themselves, so a new
+# decision can never be left out of the key by accident) plus the seed. Thirty
+# students exploring the same scenario then share each other's results, and the
+# rehearsal / audit tools stop re-running rushes they have already run.
+def cfg_signature(cfg):
+    d = dataclasses.asdict(cfg)
+    d["layout"] = tuple(sorted((k, tuple(v)) for k, v in d["layout"].items()))
+    d["time_mult"] = tuple(sorted(d["time_mult"].items()))
+    return tuple(sorted(d.items(), key=lambda kv: kv[0]))
+
+
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=2048)
+def _sim_cached(sig, seed, _cfg):
+    # `sig` IS the cache key and must NOT start with an underscore — Streamlit
+    # excludes underscore-prefixed arguments from the key, which would collapse
+    # every shop that shares a seed onto one cached result. `_cfg` is excluded
+    # on purpose: it rides along to do the work without being hashed.
+    return sim.run_simulation(_cfg, base_seed=seed)
+
+
+def run_sim(cfg, base_seed=1234):
+    """Cached stand-in for sim.run_simulation used everywhere in the UI."""
+    try:
+        return _sim_cached(cfg_signature(cfg), base_seed, cfg)
+    except Exception:
+        return sim.run_simulation(cfg, base_seed=base_seed)
 
 # Everything the shop can switch ON that is not a tiered lean level: the flag on
 # Config, the name students see, and the state key that drives it.
@@ -1878,8 +2028,8 @@ def next_step_options(cfg, allowed=None):
 def test_one_option(cfg, opt):
     """Run ONE chosen change vs the current shop and return the outcome only
     (no ranking, no 'best' verdict -- the student decides)."""
-    cur = sim.run_simulation(_clone(cfg), base_seed=ANALYSIS_SEED)
-    r = sim.run_simulation(opt["mod"], base_seed=ANALYSIS_SEED)
+    cur = run_sim(_clone(cfg), base_seed=ANALYSIS_SEED)
+    r = run_sim(opt["mod"], base_seed=ANALYSIS_SEED)
     return dict(name=opt["name"], short=opt["short"], added_cost=opt["cost"],
                 d_profit=r.profit - cur.profit,
                 d_score=r.lean_score - cur.lean_score,
@@ -1889,7 +2039,7 @@ def test_one_option(cfg, opt):
 def baseline_ref(demand):
     if demand not in st.session_state.baseline:
         b = _baseline_cfg(SC); b["demand"] = demand; b["reps"] = 6
-        st.session_state.baseline[demand] = sim.run_simulation(
+        st.session_state.baseline[demand] = run_sim(
             cfg_from_state(b), base_seed=555)
     return st.session_state.baseline[demand]
 
@@ -1941,10 +2091,10 @@ def plan_changes(old, new):
 def debrief_roi(final_cfg, scenario):
     """Leave-one-out: how much profit / Lean each of the student's improvements
     was actually adding to their FINAL shop (revealed only in the debrief)."""
-    base = sim.run_simulation(_clone(final_cfg), base_seed=ANALYSIS_SEED)
+    base = run_sim(_clone(final_cfg), base_seed=ANALYSIS_SEED)
 
     def contrib(name, cost, **revert):
-        v = sim.run_simulation(_clone(final_cfg, **revert), base_seed=ANALYSIS_SEED)
+        v = run_sim(_clone(final_cfg, **revert), base_seed=ANALYSIS_SEED)
         return dict(short=name, added_cost=cost,
                     d_profit=base.profit - v.profit,
                     d_score=base.lean_score - v.lean_score)
@@ -2002,10 +2152,10 @@ SPEND_TOLERANCE = 0.75   # $/rush of simulation noise we forgive
 def spend_audit(cfg):
     """[(name, step, $ of the step, Δprofit it buys)] for every paid choice,
     each compared against the NEXT CHEAPER step rather than against nothing."""
-    base = sim.run_simulation(_clone(cfg), base_seed=ANALYSIS_SEED)
+    base = run_sim(_clone(cfg), base_seed=ANALYSIS_SEED)
 
     def step(name, label, cost, **cheaper):
-        v = sim.run_simulation(_clone(cfg, **cheaper), base_seed=ANALYSIS_SEED)
+        v = run_sim(_clone(cfg, **cheaper), base_seed=ANALYSIS_SEED)
         return dict(name=name, step=label, cost=cost,
                     d_profit=base.profit - v.profit)
 
@@ -2322,9 +2472,9 @@ def _profit_by_waste(cfg, allowed):
     add right now (max over that waste's available options). Drives the coach toward
     the most *profitable* next fix when several are on the table."""
     out = {}
-    base = sim.run_simulation(_clone(cfg), base_seed=ANALYSIS_SEED)
+    base = run_sim(_clone(cfg), base_seed=ANALYSIS_SEED)
     for opt in next_step_options(cfg, allowed=allowed):
-        r = sim.run_simulation(opt["mod"], base_seed=ANALYSIS_SEED)
+        r = run_sim(opt["mod"], base_seed=ANALYSIS_SEED)
         dp = r.profit - base.profit
         out[opt["waste"]] = max(out.get(opt["waste"], -1e9), dp)
     return out
@@ -2934,10 +3084,10 @@ if _res is not None:
     dc1, dc2 = st.columns([1.05, 1])
     with dc1:
         st.markdown("**The 7 wastes** (🟢 ok · 🟡 watch · 🔴 problem)")
-        st.pyplot(seven_waste_fig(diag))
+        show_seven_wastes(diag)
     with dc2:
         st.markdown("**Your 5S** (5 of these fix 5 of the wastes)")
-        st.pyplot(five_s_fig(cfg_done))
+        show_five_s(cfg_done)
     _show = [x for x in diag if (not dec_unlocked) or x["waste"].lower() in dec_unlocked]
     if _show:
         st.markdown("**What's happening in the wastes you can act on now:**")
@@ -2945,17 +3095,22 @@ if _res is not None:
             st.markdown(f"{RAG[x['flag']]} **{x['waste']}** — {x['detail']}  "
                         f"*→ fix in the decision: {x['concept']}.*")
 
-    with st.expander("📂 More detail — pick a tab (5S, charts, costs, progress)"):
-        t_5s, t_prob, t_var, t_cost, t_prog = st.tabs(
-            ["🧹 5S detail", "👀 Problem visuals", "📊 Variability",
-             "💵 Costs & ROI", "📈 Progress"])
-        with t_5s:
+    # PERFORMANCE: this used to be st.tabs(...), and Streamlit executes the body
+    # of EVERY tab on EVERY rerun — five views' worth of figures and charts each
+    # time a student clicked anything, whether or not they ever opened the panel.
+    # A radio renders only the view actually chosen, so a click costs one view.
+    with st.expander("📂 More detail — pick a view (5S, charts, costs, progress)"):
+        _VIEWS = ["🧹 5S detail", "👀 Problem visuals", "📊 Variability",
+                  "💵 Costs & ROI", "📈 Progress"]
+        _view = st.radio("Detail view", _VIEWS, horizontal=True,
+                         key="detail_view", label_visibility="collapsed")
+        if _view == _VIEWS[0]:
             for name, done, decision, doing in five_s_status(cfg_done):
                 st.markdown(f"{'✅' if done else '⬜'} **{name}** — {doing}  \n"
                             f"&nbsp;&nbsp;&nbsp;*decision: {decision}*")
-        with t_var:
+        elif _view == _VIEWS[2]:
             st.markdown("**Managing variability — the spread, not just the average.**")
-            st.pyplot(cycle_hist(res.all_cycle_times))
+            show_cycle_hist(res.all_cycle_times)
             reps = res.reps
             worst = max(reps, key=lambda r: r["abandoned"] / max(1, r["arrivals"]))
             best = min(reps, key=lambda r: r["abandoned"] / max(1, r["arrivals"]))
@@ -2969,15 +3124,15 @@ if _res is not None:
             st.info("Raising **standard work** makes each drink a more consistent "
                     "time — the histogram narrows and the gap between good and bad "
                     "days shrinks. Predictability is itself a lean win.")
-        with t_prob:
+        elif _view == _VIEWS[1]:
             order_done = cfg_layout_order(cfg_done)
             st.caption("🕒 Shows the shop **as you ran it this round**; your pending "
                        "edits apply next rush.")
             st.markdown("**How your drink flowed**")
-            st.pyplot(flow_fig(order_done))
+            show_flow(order_done)
             st.markdown("**Where inventory piled up** — 🔵 prep · 🟠 WIP · 🔴 made-"
                         "ahead · dots = customers waiting.")
-            st.pyplot(inventory_map_fig(order_done, res, cfg_done))
+            show_inventory_map(order_done, res, cfg_done)
             v1, v2 = st.columns(2)
             tl = res.timeline
             with v1:
@@ -2991,7 +3146,7 @@ if _res is not None:
                                     "walked out": tl["walked_out"]},
                                    index=[round(x, 1) for x in tl["min"]])
                 fdf.index.name = "minute"; st.line_chart(fdf)
-        with t_cost:
+        elif _view == _VIEWS[3]:
             base = baseline_ref(cfg_done.demand_level)
             dprofit = res.profit - base.profit
             st.caption(f"Lean upkeep costs **${res.upkeep:.0f}/rush**.")
@@ -3003,7 +3158,7 @@ if _res is not None:
             st.bar_chart(cb, horizontal=True)
             st.caption(f"Revenue \\${res.revenue:.0f} − Cost \\${res.total_cost:.0f} "
                        f"= Profit \\${res.profit:.0f}")
-        with t_prog:
+        elif _view == _VIEWS[4]:
             if len(hist) >= 2:
                 h = pd.DataFrame(hist).set_index("round")
                 kk = st.columns(2)
@@ -3121,7 +3276,7 @@ def layout_editor():
     else:
         _button_reorder()
 
-    st.pyplot(flow_fig(C["order"]))
+    show_flow(C["order"])
     bt = backtracks(C["order"])
     legend = ("🟢 every arrow points forward — clean flow!" if bt == 0
               else f"🔴 {bt} backward arrow(s) = the drink doubles back = wasted "
@@ -3339,7 +3494,7 @@ with st.container():
     # frameworks stay front-and-center
     if "transport" not in dec_unlocked:
         st.caption(f"Current drink path: {order_distance(C['order'])} steps.")
-        st.pyplot(flow_fig(C["order"]))
+        show_flow(C["order"])
     if dec_unlocked:
         st.markdown("**Your 5S progress** (the five S's are five of the seven "
                     "waste fixes above):")
@@ -3367,8 +3522,8 @@ if st.session_state.last_result is not None and dec_unlocked:
             cache = st.session_state.get("dryrun_cache")
             if not cache or cache[0] != sig:
                 with st.spinner("Previewing your plan…"):
-                    _bd = sim.run_simulation(_clone(_cfgL), base_seed=ANALYSIS_SEED)
-                    _pd = sim.run_simulation(_clone(cfg), base_seed=ANALYSIS_SEED)
+                    _bd = run_sim(_clone(_cfgL), base_seed=ANALYSIS_SEED)
+                    _pd = run_sim(_clone(cfg), base_seed=ANALYSIS_SEED)
                 cache = (sig, dict(name="; ".join(chg)[:90], added_cost=0,
                                    d_profit=_pd.profit - _bd.profit,
                                    d_score=_pd.lean_score - _bd.lean_score,
@@ -3412,7 +3567,7 @@ if st.session_state.last_result is not None and dec_unlocked:
                                 f"/rush** → profit **{r['d_profit']:+.0f}\\$**, "
                                 f"served **{r['d_served']:+.0f}**, Lean "
                                 f"**{r['d_score']:+.0f}**")
-                st.pyplot(impact_effort_chart(_rows))
+                show_impact_effort(_rows)
             elif _rows:
                 st.info("Your plan changed since the last test — click **Run / "
                         "re-run the test** to refresh.")
@@ -3483,7 +3638,7 @@ def summarize(res, cfg):
 
 if run:
     with st.spinner("Simulating the rush…"):
-        res = sim.run_simulation(cfg, base_seed=1000 + rnd)
+        res = run_sim(cfg, base_seed=1000 + rnd)
     st.session_state.last_result = res
     st.session_state.last_cfg = copy.deepcopy(cfg)
     # JSON-able snapshot of exactly what was run + its seed, so a resumed session
@@ -3699,7 +3854,7 @@ if res is not None:
             with st.spinner("Analysing your decisions…"):
                 roi = debrief_roi(cfg_done, SC)
             if roi:
-                st.pyplot(impact_effort_chart(roi))
+                show_impact_effort(roi)
                 roi_sorted = sorted(roi, key=lambda r: -r["d_profit"])
                 st.dataframe(pd.DataFrame([{
                     "Your decision": r["short"],
