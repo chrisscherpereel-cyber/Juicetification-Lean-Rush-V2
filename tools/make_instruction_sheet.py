@@ -96,20 +96,21 @@ for i, (k, d) in enumerate([
     sy -= 0.030
 
 # --------------------------------------------------------- 2. your goal ---
-section(0.700, 2, "You finish when all three are ticked")
+section(0.700, 2, "You finish when all four are ticked")
 
-goals = [("All 7 wastes addressed", "each has its counter-measure"),
-         ("Lean Score  ≥ 70", "quality, speed, flow, low waste"),
-         ("Running a profit > $0", "the fix must pay for itself")]
-gw = (R - L - 2 * 0.018) / 3
+goals = [("All 7 wastes fixed", "each one countered"),
+         ("Lean Score  ≥ 70", "quality, speed, flow"),
+         ("Profit  > $0", "the shop makes money"),
+         ("Spending pays off", "drop what doesn't pay")]
+gw = (R - L - 3 * 0.014) / 4
 for i, (title, sub) in enumerate(goals):
-    gx = L + i * (gw + 0.018)
+    gx = L + i * (gw + 0.014)
     box(gx, 0.612, gw, 0.062, fc=PALE, ec=TEAL, lw=1.3)
-    fig.add_artist(Circle((gx + 0.024, 0.655), 0.010, transform=T,
+    fig.add_artist(Circle((gx + 0.020, 0.655), 0.009, transform=T,
                           facecolor=TEAL, edgecolor="none", zorder=3))
-    txt(gx + 0.024, 0.655, "✓", 9, "white", "bold", ha="center", z=4)
-    txt(gx + 0.042, 0.655, title, 9.6, DARK, "bold")
-    txt(gx + 0.014, 0.632, sub, 8.0, GREY)
+    txt(gx + 0.020, 0.655, "✓", 8, "white", "bold", ha="center", z=4)
+    txt(gx + 0.035, 0.655, title, 8.6, DARK, "bold")
+    txt(gx + 0.012, 0.632, sub, 7.4, GREY)
 txt(L, 0.599, "There is no fixed number of rounds — take as many as you need.",
     8.6, GREY, style="italic")
 
@@ -196,11 +197,11 @@ txt(L, 0.113,
 box(L, 0.052, R - L, 0.054, fc=PALE, ec=TEAL, lw=1.2)
 txt(L + 0.016, 0.091, "Finishing up — how to hand in", 10, DARK, "bold")
 txt(L + 0.016, 0.074,
-    "When all three objectives are ticked, a debrief opens. The four reflections and "
+    "When all four objectives are ticked, a debrief opens. The four reflections and "
     "the 5-question check are", 8.5, GREY)
 txt(L + 0.016, 0.062,
-    "required and reviewed by your instructor — they unlock your PDF report. Add your "
-    "name in the sidebar first.", 8.5, GREY)
+    "required and reviewed by your instructor. Download the report any time: page 1 says "
+    "COMPLETE or INCOMPLETE.", 8.5, GREY)
 
 fig.text(0.5, 0.028, "Juicetification: The Lean Rush  ·  student quick guide",
          fontsize=7.5, color=LGREY, ha="center")

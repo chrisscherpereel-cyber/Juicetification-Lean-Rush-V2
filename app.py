@@ -7,7 +7,6 @@ Run with:  streamlit run app.py
 from __future__ import annotations
 
 
-import hashlib
 import heapq
 import json
 import math
@@ -2576,6 +2575,37 @@ def coach_mc(cfg, res, diag, allowed, asked):
 # --------------------------------------------------------------------------
 # LMS progress report (downloadable HTML + CSV)
 # --------------------------------------------------------------------------
+def report_status():
+    """Is this a COMPLETE submission, and if not, what is still missing?
+
+    The report can always be downloaded — a partial one is still evidence of the
+    work done — so this is what tells the student (and the instructor reading the
+    PDF) exactly where it stands. Every piece is checked from the recorded
+    answers themselves, so the verdict is the same whether or not the debrief
+    section happens to be on screen."""
+    refl = st.session_state.get("reflections", {}) or {}
+    hist = st.session_state.get("history", []) or []
+    n_refl = sum(1 for k in refl if str(k).startswith("Debrief"))
+    n_quiz = sum(1 for k in refl if str(k).startswith("Knowledge check"))
+    objectives_ok = bool(st.session_state.get("goal_reached_once"))
+
+    missing = []
+    if not hist:
+        missing.append("no rounds played yet")
+    if not objectives_ok:
+        missing.append("the four simulation objectives are not all met yet")
+    if n_refl < 4:
+        missing.append(f"written reflections ({n_refl} of 4 answered)")
+    if n_quiz < len(DEBRIEF_QUIZ):
+        missing.append(f"knowledge check ({n_quiz} of {len(DEBRIEF_QUIZ)} answered)")
+    if not (st.session_state.get("student") or "").strip():
+        missing.append("your name / student ID is not entered")
+
+    return dict(complete=not missing, missing=missing, rounds=len(hist),
+                objectives_ok=objectives_ok, reflections=n_refl,
+                quiz=n_quiz, quiz_total=len(DEBRIEF_QUIZ))
+
+
 def _report_context():
     hist = st.session_state.history
     best = max((h["lean_score"] for h in hist), default=0)
@@ -2603,10 +2633,12 @@ def build_report_pdf():
     refl = st.session_state.reflections
     name = st.session_state.student or "(name not entered)"
     today = _dt.date.today().strftime("%B %d, %Y")
+    status = report_status()
 
     LEFT, RIGHT, TOP, BOT = 0.09, 0.91, 0.90, 0.075
     TEAL, DARK, GREY, LGREY, LINE = ("#2a9d8f", "#264653", "#5f6b6b",
                                      "#9aa0a0", "#e2e6e6")
+    AMBER, AMBER_DK = "#fdf0d5", "#9c6b15"
     S = {"fig": None, "y": TOP, "page": 0}
     buf = _io.BytesIO()
     pdf = PdfPages(buf)
@@ -2620,7 +2652,11 @@ def build_report_pdf():
             return
         f = S["fig"]
         rule(0.055)
-        f.text(LEFT, 0.039, "Juicetification: The Lean Rush", fontsize=7.5, color=LGREY)
+        _foot = "Juicetification: The Lean Rush"
+        if not status["complete"]:
+            _foot += "  ·  INCOMPLETE REPORT"
+        f.text(LEFT, 0.039, _foot, fontsize=7.5,
+               color=LGREY if status["complete"] else AMBER_DK)
         f.text(RIGHT, 0.039, f"Page {S['page']}", fontsize=7.5, color=LGREY,
                ha="right")
         pdf.savefig(f)
@@ -2691,7 +2727,29 @@ def build_report_pdf():
            color="white", fontweight="bold")
     f.text(LEFT, 0.927, "Lean Operations Simulation — Student Report",
            fontsize=10.5, color="#dff3ef")
-    S["y"] = 0.892
+    # ---- status band: the first thing anyone reads on this report ----------
+    _miss_lines = [] if status["complete"] else _tw.wrap(
+        "Still outstanding: " + "; ".join(status["missing"]) + ".", 112)[:3]
+    _band_h = 0.030 if status["complete"] else 0.034 + 0.013 * len(_miss_lines)
+    _band_y = 0.917 - _band_h - 0.008
+    f.add_artist(Rectangle((LEFT, _band_y), RIGHT - LEFT, _band_h,
+                           transform=f.transFigure,
+                           facecolor="#eaf6f3" if status["complete"] else AMBER,
+                           edgecolor=TEAL if status["complete"] else AMBER_DK,
+                           lw=1.4, zorder=1))
+    if status["complete"]:
+        f.text(LEFT + 0.012, _band_y + _band_h / 2,
+               "COMPLETE REPORT  —  simulation objectives met, debrief finished",
+               fontsize=11, color=TEAL, fontweight="bold", va="center", zorder=2)
+    else:
+        f.text(LEFT + 0.012, _band_y + _band_h - 0.014,
+               "INCOMPLETE REPORT  —  submitted before the work was finished",
+               fontsize=11, color=AMBER_DK, fontweight="bold", va="center", zorder=2)
+        for _i, _line in enumerate(_miss_lines):
+            f.text(LEFT + 0.012, _band_y + _band_h - 0.030 - _i * 0.013, _line,
+                   fontsize=8.2, color=AMBER_DK, va="center", zorder=2)
+    S["y"] = _band_y - 0.022
+
     para(f"Student:  {name}", size=10.5, color=DARK, bold=True, after=0.002)
     para(f"Scenario #{SC['sid']}    ·    Demand: {SC['demand']}    ·    {today}",
          size=9.5, color=GREY, after=0.011)
@@ -2945,8 +3003,9 @@ if st.session_state.round == 1 and not st.session_state.history:
                "lose your progress.\n")
             + "- 🎓 **There is a required debrief.** The game ends with short written "
               "reflections and a knowledge check that are **required and reviewed by "
-              "your instructor**; your report unlocks only after you finish them. Play "
-              "to *learn the ideas*, not just to hit the numbers.\n"
+              "your instructor**. You can download your report at any time, but it is "
+              "stamped **INCOMPLETE** until they are done. Play to *learn the ideas*, "
+              "not just to hit the numbers.\n"
             + "- ▶️ **How each round works:** run the rush → read what went wrong → "
               "answer the coach → change one decision → run again, until you've "
               "addressed all seven wastes with a solid Lean Score and a profit.")
@@ -3685,13 +3744,10 @@ if res is not None:
                     "debrief. **Free play** is now unlocked in the sidebar if you "
                     "want to keep experimenting.")
             # persist a completion record for the Director (once; no-op when
-            # storage is unconfigured)
+            # storage is unconfigured). There is no completion code: what the
+            # student submits is the PDF report itself.
             if not st.session_state.get("_completion_recorded"):
-                _code = "LR-" + hashlib.sha256(
-                    f"{game or ''}|{sid or ''}|{SC['sid']}".encode()
-                ).hexdigest()[:8].upper()
-                store.record_completion(game, sid, completion_code=_code,
-                                        score=round(res.profit, 1))
+                store.record_completion(game, sid, score=round(res.profit, 1))
                 st.session_state["_completion_recorded"] = True
                 _autosave()
             st.markdown("## 🎓 Debrief — make sense of the whole game")
@@ -3804,12 +3860,12 @@ if res is not None:
             if _refl_done < 4:
                 st.caption(f"{_refl_done}/4 written reflections answered.")
 
-            # ---- knowledge check (MCQ) — required before the report unlocks ----
+            # ---- knowledge check (MCQ) — required for a COMPLETE report ----
             st.divider()
             st.markdown("### 🧠 Knowledge check")
             st.caption("Answer all of these to show what you took away — they, and "
-                       "the reflections above, must be complete before your report "
-                       "unlocks. Your answers appear on the report.")
+                       "the reflections above, are what make your report count as "
+                       "COMPLETE. Your answers appear on the report.")
             _quiz_correct = _quiz_answered = 0
             for _qi, _qz in enumerate(DEBRIEF_QUIZ):
                 _opts = list(_qz["options"])
@@ -3842,7 +3898,8 @@ if res is not None:
                            "download your PDF report below. 👏")
             else:
                 st.warning("Finish all four reflections **and** the knowledge check "
-                           "to unlock the report download.")
+                           "for your report to count as COMPLETE. You can download "
+                           "it before then, but it will be stamped INCOMPLETE.")
 
             # ---- THE REVEAL: what was actually worth doing (held until now) ----
             st.divider()
@@ -3885,17 +3942,29 @@ with st.expander("📄 Progress report — download for your LMS", expanded=Fals
                    "on the report.")
     if not st.session_state.history:
         st.info("Play at least one round first, then come back to download.")
-    elif not st.session_state.get("debrief_ready"):
-        st.info("📝 The report unlocks once you finish the game and complete the "
-                "**debrief** — all four written reflections **and** the knowledge "
-                "check. Scroll up to the debrief to finish them.")
     else:
+        # The report is ALWAYS downloadable — a partial one is still a record of
+        # the work done. It simply says on its first page whether it is complete,
+        # and exactly what is outstanding if it isn't.
+        _rs = report_status()
+        if _rs["complete"]:
+            st.success("✅ **This report is COMPLETE** — objectives met and the "
+                       "debrief finished. It is marked COMPLETE on page 1.")
+        else:
+            st.warning(
+                "⚠️ **This report is INCOMPLETE.** You can still download and "
+                "submit it, and it will be clearly marked INCOMPLETE on page 1, "
+                "listing what is outstanding:\n\n"
+                + "\n".join(f"- {m}" for m in _rs["missing"]))
         safe = (st.session_state.student or "student").replace(" ", "_")
-        st.download_button("⬇️  Download PDF report",
-                           data=build_report_pdf(),
-                           file_name=f"justification_{safe}_sc{SC['sid']}.pdf",
-                           mime="application/pdf", use_container_width=True,
-                           type="primary")
+        _tag = "" if _rs["complete"] else "_INCOMPLETE"
+        st.download_button(
+            ("⬇️  Download PDF report" if _rs["complete"]
+             else "⬇️  Download PDF report (marked incomplete)"),
+            data=build_report_pdf(),
+            file_name=f"justification_{safe}_sc{SC['sid']}{_tag}.pdf",
+            mime="application/pdf", use_container_width=True,
+            type="primary")
         st.caption("A ready-to-submit PDF with your scenario, round-by-round "
                    "results, decisions, tested options, reflections, and knowledge "
                    "check.")

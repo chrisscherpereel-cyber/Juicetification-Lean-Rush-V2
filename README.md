@@ -131,10 +131,13 @@ it. Once the objectives are met, students get:
   accuracy, and transfer to a real process);
 - a **five-question knowledge check** with instant feedback and a score.
 
-**The PDF report unlocks only after every reflection and the knowledge check are
-complete.** It is a clean, auto-paginating, multi-page document — title page with
-KPI cards, a round-by-round table, decisions per round, and every recorded answer
-— ready to submit to an LMS.
+**The PDF report can be downloaded at any time after the first round, and its
+first page says plainly whether it is COMPLETE or INCOMPLETE** — an incomplete one
+also lists exactly what is outstanding (objectives not yet met, reflections or
+knowledge-check questions unanswered, no name entered) and is tagged in the page
+footer and the file name. It is a clean, auto-paginating, multi-page document —
+title page with KPI cards, a round-by-round table, decisions per round, and every
+recorded answer — ready to submit to an LMS.
 
 ---
 
@@ -204,7 +207,7 @@ key plus Dropbox credentials — see the module header), the app:
   refresh or a return visit lands on the same shop;
 - **autosaves** progress after each meaningful step and **restores** it on load
   (`?sid=` in the URL makes resume automatic); and
-- **records a completion** (code + P&L) the Director can read for grading.
+- **records a completion** (final P&L) the Director can read for grading.
 
 **Troubleshooting.** If students aren't asked to log in or progress isn't saving,
 open the app with **`?diag=1`** — a self-check page that shows whether this
