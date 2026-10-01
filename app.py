@@ -358,6 +358,57 @@ class _Order:
     finish_t: float = 0.0
     reworked: bool = False
     from_premade: bool = False
+    work: float = 0.0               # seconds actually being worked on (not waiting)
+
+
+# --------------------------------------------------------------------------
+# Value-added vs waste time
+# --------------------------------------------------------------------------
+# Every second of a drink's lead time (order -> hand-off) is one of three kinds:
+#   * VALUE-ADDED   -- transforms the drink in a way the customer would pay for
+#                      (adding fruit and ice, blending, pouring/finishing);
+#   * NECESSARY     -- adds no value but can't be avoided with today's process
+#                      (grabbing a cup, blender set-up, the shortest walk);
+#   * WASTE         -- everything else: searching, extra walking, extra
+#                      finishing steps, a slow/crowded station, waiting in line.
+# The split is measured inside the simulation, drink by drink.
+VA_PARTS = ["Value-added"]
+NVA_PARTS = ["Necessary (cup, set-up, shortest walk)"]
+WASTE_PARTS = ["Searching (Motion)", "Extra walking (Transport)",
+               "Extra finishing steps (Overprocessing)",
+               "Slow station & crowding", "Waiting in line (Waiting)"]
+TIME_PARTS = VA_PARTS + NVA_PARTS + WASTE_PARTS
+_BEST_FINISH = min(l["finish"] for l in STANDARD_LEVELS)
+
+
+def _time_parts(cfg, fs, crowd, motion_time, fetch_time, blend_time, finish_time,
+                premade_drink=False):
+    """Mean seconds of each kind of in-process time for one drink."""
+    _tm = lambda s: cfg.time_mult.get(s, 1.0)
+    fin_core = BASE_STEP_TIME["Finish"] * _BEST_FINISH
+    fin_extra = max(0.0, finish_time - fin_core * _tm("Finish") * crowd)
+    if premade_drink:                  # made earlier: only the finish happens now
+        va = fin_core
+        return {"Value-added": va,
+                "Necessary (cup, set-up, shortest walk)": 0.0,
+                "Searching (Motion)": 0.0, "Extra walking (Transport)": 0.0,
+                "Extra finishing steps (Overprocessing)": fin_extra,
+                "Slow station & crowding": max(0.0, finish_time - va - fin_extra)}
+    va = (BASE_STEP_TIME["Fruit"] + BASE_STEP_TIME["Ice"]
+          + BASE_STEP_TIME["Blender"] + fin_core)
+    ideal_walk = (path_distance({s: (0, i) for i, s in enumerate(ROUTE + ["Pickup"])})
+                  * WALK_SECONDS_PER_UNIT)
+    nva = BASE_STEP_TIME["Cups"] + BLEND_SETUP + min(motion_time, ideal_walk)
+    raw_fetch = (BASE_STEP_TIME["Cups"] * _tm("Cups") + BASE_STEP_TIME["Fruit"]
+                 * _tm("Fruit") + BASE_STEP_TIME["Ice"] * _tm("Ice"))
+    search = raw_fetch * (fs - 1.0) * crowd
+    walk = max(0.0, motion_time - ideal_walk)
+    total = fetch_time + motion_time + blend_time + finish_time
+    slow = max(0.0, total - va - nva - search - walk - fin_extra)
+    return {"Value-added": va, "Necessary (cup, set-up, shortest walk)": nva,
+            "Searching (Motion)": search, "Extra walking (Transport)": walk,
+            "Extra finishing steps (Overprocessing)": fin_extra,
+            "Slow station & crowding": slow}
 
 
 def _lognormal(sim: _Sim, mean: float, cv: float) -> float:
@@ -399,6 +450,12 @@ def _run_once(cfg: Config, seed: int) -> Dict:
                    * (CONVEYOR_WALK_FACTOR if cfg.conveyor else 1.0))
     # Specialized mode keeps workers at stations: far less transport.
     spec_motion = HANDOFF_TIME * len(ROUTE)
+    _walk = motion_time if cfg.assignment_mode == "Whole-order" else spec_motion
+    parts_fresh = _time_parts(cfg, fs, crowd, _walk, fetch_time, blend_time,
+                              finish_time)
+    parts_pre = _time_parts(cfg, fs, crowd, _walk, fetch_time, blend_time,
+                            finish_time, premade_drink=True)
+    tsplit = {k: 0.0 for k in TIME_PARTS}      # summed over served drinks
 
     employees = _Resource(cfg.employees)
     blenders = _Resource(cfg.blenders)
@@ -440,6 +497,10 @@ def _run_once(cfg: Config, seed: int) -> Dict:
         if extras > 0:
             premade[o.dtype] = premade.get(o.dtype, 0) + extras
 
+    def worked(o: _Order, d: float) -> float:
+        o.work += d                  # time the drink is actually being worked on
+        return d
+
     def complete(o: _Order, from_premade: bool = False):
         nonlocal in_system, defects, waste_units
         touch_wip()
@@ -449,6 +510,13 @@ def _run_once(cfg: Config, seed: int) -> Dict:
         series.append((sim.now, in_system))
         srv_t.append(sim.now)
         served.append(o.finish_t - o.arrive)
+        # split this drink's lead time: its sampled work time shared out in the
+        # proportions of its mean parts, and everything else is waiting
+        parts = parts_pre if from_premade else parts_fresh
+        tot = sum(parts.values()) or 1.0
+        for k, v in parts.items():
+            tsplit[k] += o.work * v / tot
+        tsplit["Waiting in line (Waiting)"] += max(0.0, served[-1] - o.work)
         p = p_defect + (PREMADE_DEFECT_BONUS if from_premade else 0.0)
         if sim.rng.random() < p:
             # caught + reworked: extra ingredients wasted, counts as incorrect.
@@ -469,10 +537,11 @@ def _run_once(cfg: Config, seed: int) -> Dict:
         if premade.get(o.dtype, 0) > 0:
             premade[o.dtype] -= 1
             o.from_premade = True
-            sim.schedule(_lognormal(sim, finish_time, cv), lambda: wo_finish(o))
+            sim.schedule(worked(o, _lognormal(sim, finish_time, cv)),
+                         lambda: wo_finish(o))
         else:
             nonlocal_walk(dist)
-            pre = _lognormal(sim, fetch_time + motion_time, cv)
+            pre = worked(o, _lognormal(sim, fetch_time + motion_time, cv))
             sim.schedule(pre, lambda: wo_blend_req(o))
 
     def wo_blend_req(o: _Order):
@@ -480,12 +549,13 @@ def _run_once(cfg: Config, seed: int) -> Dict:
         blenders.request(lambda: wo_blend(o))
 
     def wo_blend(o: _Order):
-        sim.schedule(_lognormal(sim, blend_time, cv), lambda: wo_post(o))
+        sim.schedule(worked(o, _lognormal(sim, blend_time, cv)), lambda: wo_post(o))
 
     def wo_post(o: _Order):
         blenders.release()
         make_ahead(o)                 # extras from the batch -> premade stock
-        sim.schedule(_lognormal(sim, finish_time, cv), lambda: wo_finish(o))
+        sim.schedule(worked(o, _lognormal(sim, finish_time, cv)),
+                     lambda: wo_finish(o))
 
     def wo_finish(o: _Order):
         employees.release()
@@ -511,14 +581,15 @@ def _run_once(cfg: Config, seed: int) -> Dict:
             finstn.request(lambda: sp_finish(o))
             return
         nonlocal_walk(spec_motion / WALK_SECONDS_PER_UNIT)
-        sim.schedule(_lognormal(sim, fetch_time + spec_motion, cv),
+        sim.schedule(worked(o, _lognormal(sim, fetch_time + spec_motion, cv)),
                      lambda: (prep.release(), blendstn.request(lambda: sp_blend_req(o))))
 
     def sp_blend_req(o: _Order):
         blenders.request(lambda: sp_blend(o))
 
     def sp_blend(o: _Order):
-        sim.schedule(_lognormal(sim, blend_time, cv), lambda: sp_blend_done(o))
+        sim.schedule(worked(o, _lognormal(sim, blend_time, cv)),
+                     lambda: sp_blend_done(o))
 
     def sp_blend_done(o: _Order):
         blenders.release()
@@ -527,7 +598,8 @@ def _run_once(cfg: Config, seed: int) -> Dict:
         finstn.request(lambda: sp_finish(o))
 
     def sp_finish(o: _Order):
-        sim.schedule(_lognormal(sim, finish_time, cv), lambda: sp_finish_done(o))
+        sim.schedule(worked(o, _lognormal(sim, finish_time, cv)),
+                     lambda: sp_finish_done(o))
 
     def sp_finish_done(o: _Order):
         finstn.release()
@@ -665,6 +737,7 @@ def _run_once(cfg: Config, seed: int) -> Dict:
         "cum_arr": cum_arr,
         "cum_srv": cum_srv,
         "cum_ab": cum_ab,
+        "time_split": {k: v / max(1, len(served)) for k, v in tsplit.items()},
     }
 
 
@@ -708,6 +781,14 @@ class RoundResult:
     cost_breakdown: Dict[str, float]
     timeline: Dict[str, List[float]]
     reps: List[Dict]
+    # mean seconds per served drink in each kind of time (see TIME_PARTS)
+    time_split: Dict[str, float] = field(default_factory=dict)
+
+    @property
+    def va_pct(self) -> float:
+        """Value-added share of a drink's lead time (process cycle efficiency)."""
+        tot = sum(self.time_split.values())
+        return 100.0 * self.time_split.get("Value-added", 0.0) / tot if tot else 0.0
 
 
 def _mean(xs):
@@ -783,6 +864,7 @@ def run_simulation(cfg: Config, base_seed: int = 1234) -> RoundResult:
         cost_breakdown=cost_breakdown,
         timeline=timeline,
         reps=reps,
+        time_split={k: _mean([r["time_split"][k] for r in reps]) for k in TIME_PARTS},
     )
 
 
@@ -1085,20 +1167,22 @@ ROUND_PLAN = {
     4: {"unlock": ["layout", "inventory", "quality", "capacity"],
         "concept": "5S #5 Sustain · Capacity",
         "title": "Round 4 — Sustain & right-size (5S step 5)",
-        "focus": "**Sustain:** turn on pull replenishment so gains stick and "
-                 "nothing spoils. Then add staff or blenders **only** where "
+        "focus": "**Sustain:** one-piece flow already keeps stock low — add FIFO "
+                 "rotation or pull replenishment only if spoilage is still costing "
+                 "you (test it first). Then add staff or blenders **only** where "
                  "customers actually pile up.",
         "why": "Sustain keeps the discipline; capacity is powerful but costs money "
-               "every rush, so add it only at the real bottleneck."},
+               "every rush, so add it only at the real bottleneck — objective 4 "
+               "checks that every purchase pays for itself."},
 }
 # Guided rounds beyond 4 when mastery isn't yet 7/7 — keep every lever open and
 # point the student at what's still unaddressed (no "core done" message yet).
 CONTINUE = {"unlock": GROUPS, "concept": "Kaizen — finish the job",
-            "title": "Keep improving — address every waste worth addressing",
-            "focus": "A few wastes still need a counter-measure. Use the coach and "
-                     "the 7-wastes dashboard to find what's left, then fix it.",
-            "why": "The core is complete only when every one of the 7 wastes has a "
-                   "sensible counter-measure in place (lean mastery 7/7)."}
+            "title": "Keep improving — meet all four objectives",
+            "focus": "Check the **🎯 Objectives** list (in CHECK and the sidebar): "
+                     "each ⬜ shows how to meet it. Use the coach if you're stuck.",
+            "why": "The core is complete when all four objectives are true in the "
+                   "same rush: wastes fixed, Lean Score, profit, no wasted spending."}
 FREE_PLAY = {"unlock": GROUPS, "concept": "Kaizen",
              "title": "Free play — keep improving",
              "focus": "Free play: every lever is open. Experiment to push your Lean "
@@ -1108,12 +1192,11 @@ FREE_PLAY = {"unlock": GROUPS, "concept": "Kaizen",
 # finished student to "keep improving."
 DONE_PLAN = {"unlock": GROUPS, "concept": "Kaizen — complete",
              "title": "✅ Objectives met — the core simulation is complete",
-             "focus": "You've addressed every waste worth addressing, with a "
-                      "high Lean Score, a "
-                      "healthy profit, and no spending that fails to pay for "
-                      "itself. Open the **🎓 Debrief** page (buttons at the "
-                      "top); keep "
-                      "experimenting here if you'd like.",
+             "focus": "All four objectives are met: every waste worth fixing is "
+                      "fixed, the Lean Score target is reached, the shop makes a "
+                      "profit, and nothing you pay for is wasted. Open the **🎓 "
+                      "Debrief** page (buttons at the top); keep experimenting "
+                      "here if you'd like.",
              "why": "You met all four objectives — waste, quality/flow, profit, "
                     "and spending that earns its keep."}
 
@@ -1146,6 +1229,21 @@ def _qualifying_moves(cfg, waste):
 
 _WORTH_CACHE = {}
 
+# Wastes whose counter-measure is FREE (re-order the line, stop batching and
+# pre-making, one-piece flow). These are never excused: a free fix that removes
+# waste is always the lean call, even when the rest of the shop is still too
+# broken for it to show up in profit yet.
+FREE_FIX_WASTES = {"transport", "overproduction", "inventory"}
+
+
+def _flow_reference(cfg):
+    """The student's shop with the free fixes applied (stations in process
+    order, one-piece flow). Paid counter-measures are judged HERE, not in the
+    inherited mess -- in a scrambled, over-batched shop almost nothing looks like
+    it pays, because the chaos swamps it."""
+    return _clone(cfg, layout=coords_from_order(IDEAL_ORDER), batch_size=1,
+                  premade=0)
+
 
 def worth_addressing(cfg, waste):
     """Is there a counter-measure for this waste that would actually pay for itself
@@ -1157,16 +1255,23 @@ def worth_addressing(cfg, waste):
     saves time nobody is waiting on, say. Demanding that counter-measure anyway
     would force the student to buy something the spending objective then flags:
     an unwinnable pair of rules. Lean's real answer is that you do NOT spend there,
-    so a waste with nothing worth doing counts as settled."""
+    so a waste with nothing worth doing counts as settled.
+
+    Two guards keep that exemption honest: wastes with a FREE fix are never
+    excused, and paid fixes are tested in the shop as it would be with the free
+    fixes in place (`_flow_reference`), not in the inherited mess."""
+    if waste in FREE_FIX_WASTES:
+        return True, 0.0               # free fixes are always worth doing
     key = (_spend_sig(cfg), waste)
     if key not in _WORTH_CACHE:
         if len(_WORTH_CACHE) > 400:
             _WORTH_CACHE.clear()
         best = 0.0
         try:
-            base = run_sim(_clone(cfg), base_seed=ANALYSIS_SEED)
-            for kw in _qualifying_moves(cfg, waste):
-                got = run_sim(_clone(cfg, **kw), base_seed=ANALYSIS_SEED)
+            ref = _flow_reference(cfg)
+            base = run_sim(ref, base_seed=ANALYSIS_SEED)
+            for kw in _qualifying_moves(ref, waste):
+                got = run_sim(_clone(ref, **kw), base_seed=ANALYSIS_SEED)
                 best = max(best, got.profit - base.profit)
         except Exception:
             return True, 0.0            # can't tell -> ask for the counter-measure
@@ -1274,6 +1379,67 @@ def objectives_status(cfg, res):
                 all_ok=wastes_ok and score_ok and profit_ok and spend_ok)
 
 
+# ---- the four objectives, defined ONCE and shown the same way everywhere --------
+# (key, name, what it means, how to meet it). Every screen that mentions the
+# objectives -- the CHECK panel, the sidebar tracker, the orientation, the locked
+# debrief and the report -- reads from here, so the wording can never drift.
+def objective_defs():
+    return [
+        ("wastes", "Fix every waste worth fixing",
+         "Each of the 7 wastes has its counter-measure in place. A *paid* fix "
+         "(5S, standard work, visual signals, extra capacity) can be skipped when "
+         "it wouldn't pay for itself in your shop — that shows as ➖. Free fixes "
+         "(line order, one-piece flow) can never be skipped.",
+         "Open **Which wastes are still left?** — every ⬜ needs a decision."),
+        ("score", f"Lean Score of {LEAN_TARGET} or more",
+         "The 0–100 score after each rush: customers served correctly, few wrong "
+         "drinks, fast service, smooth flow and — weighted most — little waste.",
+         "Remove waste: free fixes first, then the cheap tiers of 5S, standard "
+         "work and visual signals, then capacity at the bottleneck."),
+        ("profit", "Make a profit" + (f" of more than ${PROFIT_TARGET:.0f}"
+                                      if PROFIT_TARGET else ""),
+         "Revenue minus every cost — staff, blenders, ingredients, spoilage, "
+         "refunds, walkouts and what your improvements cost each rush.",
+         "Serve more customers correctly; don't pay for things that don't earn "
+         "it back."),
+        ("spend", "No wasted spending",
+         "Every paid choice must pay for itself: taking it back one step must not "
+         f"make the shop more than ${SPEND_TOLERANCE:.0f}/rush richer.",
+         "Step back anything under **Which spending isn't earning its keep?** "
+         "— use **Test the profit impact** before you buy."),
+    ]
+
+
+def _md_dollars(t):
+    """Escape $ so Streamlit markdown never renders a pair of them as math."""
+    return str(t).replace("\\$", "$").replace("$", "\\$")
+
+
+def render_objective_defs():
+    for i, (_, name, what, how) in enumerate(objective_defs(), 1):
+        st.markdown(f"**{i}. {_md_dollars(name)}** — {_md_dollars(what)}  \n"
+                    f"*How to meet it:* {_md_dollars(how)}")
+
+
+def objective_rows(o, res):
+    """[(met?, name, current value text)] for an objectives_status() result."""
+    fixed = sum(1 for _, ok, note in o["items"] if ok and not note)
+    skip = sum(1 for _, ok, note in o["items"] if ok and note)
+    todo = o["total"] - fixed - skip
+    vals = {"wastes": (f"{fixed} fixed" + (f" · {skip} not worth fixing here"
+                                           if skip else "")
+                       + (f" · {todo} to do" if todo else "")),
+            "score": f"{res.lean_score:{'.0f' if o['score_ok'] else '.1f'}}",
+            "profit": (f"${res.profit:.0f}" if res.profit >= 0
+                       else f"-${-res.profit:.0f}"),
+            "spend": ("nothing wasted" if o["spend_ok"] else
+                      f"{len(o['waste_rows'])} purchase"
+                      f"{'' if len(o['waste_rows']) == 1 else 's'} not paying")}
+    met = {"wastes": o["wastes_ok"], "score": o["score_ok"],
+           "profit": o["profit_ok"], "spend": o["spend_ok"]}
+    return [(met[k], name, vals[k], how) for k, name, _, how in objective_defs()]
+
+
 LADDER = pd.DataFrame([
     ["1", "Put steps in order (layout)", "Almost free", "High",
      "Arrange stations in the order used. Biggest bang for no buck."],
@@ -1371,6 +1537,21 @@ DEBRIEF_QUIZ = [
                 "just multiplies the queue — fix the flow first, then fill it."},
 ]
 
+DEBRIEF_QUIZ.append(
+    {"q": "A drink takes 110 seconds from order to hand-off, and 38 of those "
+          "seconds are blending, adding fruit and pouring. What is the most "
+          "effective lean way to shorten the 110 seconds?",
+     "options": ["Remove the non-value-added time around those 38 seconds — "
+                 "waiting, searching, extra walking",
+                 "Make the 38 seconds of blending and pouring faster",
+                 "Pre-make drinks so the 110 seconds disappears",
+                 "Nothing — 110 seconds is the time a drink takes"],
+     "answer": "Remove the non-value-added time around those 38 seconds — "
+               "waiting, searching, extra walking",
+     "explain": "Only about a third of the lead time is value-added. Lean attacks "
+                "the other two-thirds — the waste — which is cheaper and bigger "
+                "than speeding up the value-added work itself."})
+
 # The four written debrief reflections: (id, prompt, placeholder).
 DEBRIEF_QS = [
     ("biggest_lever",
@@ -1431,6 +1612,13 @@ def make_scenario(seed):
     slow_mult = round(rng.uniform(*CFG["slow_mult_range"]), 2)
     demand = rng.choice(CFG["demand_mix"])
     demand_mult = round(rng.uniform(*CFG["demand_mult_range"]), 2)
+    if demand == "Slammed":
+        # A Slammed rush is already the busiest base level; stacking the top of
+        # the demand surge on it pushed the only finishing shops to the app's
+        # capacity ceiling (6 baristas + robot juicer) and left the Lean target
+        # within noise of the best possible score. Capped after the draw, so no
+        # other scenario changes. Verified finishable across the full range.
+        demand_mult = min(demand_mult, CFG["slammed_demand_mult_max"])
     patience = rng.choice(CFG["patience_choices"])
     defect_base = round(rng.uniform(*CFG["defect_base_range"]), 2)
     start_batch = rng.choice(CFG["start_batch_choices"])    # inherited over-batching
@@ -1951,6 +2139,82 @@ def impact_effort_chart(rows):
     return fig
 
 
+# ---- value-added vs waste time ------------------------------------------------
+VT_COLORS = {"Value-added": "#2a9d8f",
+             "Necessary (cup, set-up, shortest walk)": "#a9b8bd",
+             "Searching (Motion)": "#f4a261",
+             "Extra walking (Transport)": "#e9c46a",
+             "Extra finishing steps (Overprocessing)": "#d4a5a5",
+             "Slow station & crowding": "#c8553d",
+             "Waiting in line (Waiting)": "#e76f51"}
+# which decision removes each kind of time waste
+VT_FIX = {"Searching (Motion)": "Motion · 5S Shine (clean & label)",
+          "Extra walking (Transport)": "Transport · Set in order (line order)",
+          "Extra finishing steps (Overprocessing)": "Overprocessing · Standardize",
+          "Slow station & crowding": "Waiting · capacity at the slow station "
+                                     "(or fewer people if the bar is crowded)",
+          "Waiting in line (Waiting)": "Waiting · relieve the bottleneck"}
+
+
+def va_summary(ts):
+    """(value-added %, waste seconds, biggest waste part, its seconds)."""
+    tot = sum(ts.values()) or 1.0
+    waste = {k: ts.get(k, 0.0) for k in sim.WASTE_PARTS}
+    big = max(waste, key=waste.get) if waste else None
+    return (100.0 * ts.get("Value-added", 0.0) / tot, sum(waste.values()), big,
+            waste.get(big, 0.0))
+
+
+def value_time_draw(ax, rows, fontsize=8.5, legend=True):
+    """Stacked horizontal bars: one per (label, time_split). Value-added green,
+    necessary grey, wastes in warm colours. Numbers sit INSIDE segments only
+    when they fit; the legend sits below the axes, so nothing overlaps."""
+    from matplotlib.patches import Patch
+    tots = [sum(ts.values()) for _, ts in rows] or [1.0]
+    top = max(tots) or 1.0
+    used = set()
+    for i, (label, ts) in enumerate(rows):
+        y = len(rows) - 1 - i
+        left = 0.0
+        for part in sim.TIME_PARTS:
+            v = ts.get(part, 0.0)
+            if v <= 0:
+                continue
+            used.add(part)
+            ax.barh(y, v, left=left, height=0.62, color=VT_COLORS[part],
+                    edgecolor="white", linewidth=1.0)
+            if v >= 0.075 * top:
+                ax.text(left + v / 2, y, f"{v:.0f}s", ha="center", va="center",
+                        fontsize=fontsize - 1, color="white", fontweight="bold")
+            left += v
+        pct = 100.0 * ts.get("Value-added", 0.0) / (left or 1.0)
+        ax.text(left + 0.015 * top, y, f"{left:.0f}s · {pct:.0f}% value-added",
+                ha="left", va="center", fontsize=fontsize - 0.5, color="#264653",
+                fontweight="bold")
+    ax.set_yticks(range(len(rows)))
+    ax.set_yticklabels([lbl for lbl, _ in reversed(rows)], fontsize=fontsize)
+    ax.set_xlim(0, top * 1.42)
+    ax.set_ylim(-0.6, len(rows) - 0.4)
+    ax.set_xlabel("seconds per drink, from order to hand-off", fontsize=fontsize - 0.5)
+    ax.tick_params(axis="x", labelsize=fontsize - 1)
+    for sp in ("top", "right"):
+        ax.spines[sp].set_visible(False)
+    if legend:
+        handles = [Patch(color=VT_COLORS[p], label=p)
+                   for p in sim.TIME_PARTS if p in used]
+        ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.32),
+                  ncol=3, fontsize=fontsize - 1.5, frameon=False)
+    return [p for p in sim.TIME_PARTS if p in used]
+
+
+def value_time_fig(rows):
+    fig, ax = _new_fig((7.4, 1.25 + 0.55 * len(rows)))
+    value_time_draw(ax, rows)
+    ax.set_title("Where a drink's time goes — value-added vs waste",
+                 fontsize=11, fontweight="bold")
+    return fig
+
+
 # ---- cached PNGs -----------------------------------------------------------
 # Each wrapper takes ONLY the values the picture depends on, so the cache key is
 # small, hashable and shared between every student whose shop looks the same.
@@ -1988,6 +2252,19 @@ def cycle_hist_png(cts, target=120):
 def impact_effort_png(rows):
     return _to_png(impact_effort_chart(
         [{"short": s, "added_cost": c, "d_profit": p} for s, c, p in rows]))
+
+
+@st.cache_data(**_FIG_CACHE)
+def value_time_png(rows):
+    return _to_png(value_time_fig(
+        [(lbl, dict(zip(sim.TIME_PARTS, vals))) for lbl, vals in rows]))
+
+
+def show_value_time(rows):
+    """rows: [(label, time_split dict), ...]"""
+    show_png(value_time_png(tuple(
+        (lbl, tuple(round(ts.get(p, 0.0), 1) for p in sim.TIME_PARTS))
+        for lbl, ts in rows if ts)))
 
 
 # ---- the call sites use these: same pictures, drawn at most once -----------
@@ -2115,6 +2392,15 @@ def _entry_cfg_res(h):
         c = cfg_from_state(_migrate_cfg_dict(dict(h["cdict"]), _BASELINE_KEYS))
         cache[key] = (c, run_sim(c, base_seed=h.get("seed", 1000)))
     return cache[key]
+
+
+def round_time_split(h):
+    """Value-added / waste seconds per drink for a past round (saved with the
+    round, or rebuilt for rounds saved before this was recorded)."""
+    if h.get("tsplit"):
+        return h["tsplit"]
+    _, r = _entry_cfg_res(h)
+    return dict(r.time_split) if r is not None else {}
 
 
 def prediction_verdict(idx):
@@ -2446,7 +2732,14 @@ def debrief_roi(final_cfg, scenario):
 # test a real operations manager applies: not "is 5S good?" but "is this LEVEL of
 # 5S worth what the last step cost?". A step that does not pay for itself is
 # waste, however lean-sounding its name.
-SPEND_TOLERANCE = 0.75   # $/rush of simulation noise we forgive
+# One break-even band shared by BOTH rules that judge money: a fix only counts as
+# "worth doing" when it clearly gains more than this, and a purchase is only
+# flagged as "not paying for itself" when it clearly loses more than this.
+# Anything in between is break-even -- not required, not flagged. A single, wide
+# enough band matters: with a narrow one, simulation noise made the same extra
+# barista "required" by the waste rule (+$1) and "wasted" by the spending rule
+# (-$1), and some shops could not satisfy both.
+SPEND_TOLERANCE = 2.0    # $/rush either side of break-even
 
 
 def spend_audit(cfg):
@@ -2554,7 +2847,7 @@ def _coach_bank(cfg, res):
     _inv_look = "the Waste number + the Waste/spoilage cost line"
     _inv_guide = ("Three **Sustain** moves work — pick the cheapest that does the "
                   "job. 👉 **One-piece flow** (batch 1, no pre-made) is free; **FIFO "
-                  "rotation** ($1) keeps held stock fresh; **pull / kanban** ($3) "
+                  "rotation** (\\$1) keeps held stock fresh; **pull / kanban** (\\$3) "
                   "restocks only what's used.")
     _wait_focus = "Waiting — relieve the bottleneck (test capacity before buying)"
     _wait_look = "the congestion chart + the inventory map (where WIP stacks)"
@@ -3188,27 +3481,24 @@ def build_report_pdf():
             o = objectives_status(c_obj, r_obj)
             heading(f"Objectives — Round {h_obj['round']}"
                     + (" (core simulation completed)" if dentry else " (latest)"))
-            for ok, label in ((o["wastes_ok"], f"Every waste worth addressing "
-                               f"is addressed — {o['done']}/{o['total']}"),
-                              (o["score_ok"], f"Lean Score at least {LEAN_TARGET} — "
-                               f"{r_obj.lean_score:.0f}"),
-                              (o["profit_ok"], f"Running a profit — "
-                               f"{money(r_obj.profit)}"),
-                              (o["spend_ok"], "Every dollar spent earns its keep — "
-                               f"{len(o['waste_rows'])} purchase(s) not paying "
-                               "for themselves")):
-                para(("✓  " if ok else "✗  ") + label, size=9.2,
-                     color=GOOD if ok else BAD, bold=True, after=0.002)
+            for i, (ok, nm, val, _) in enumerate(objective_rows(o, r_obj), 1):
+                para(("✓  " if ok else "✗  ") + f"{i}. {nm} — {val}", size=9.2,
+                     color=GOOD if ok else BAD, bold=True, after=0.002, md=False)
 
     # ---- round-by-round results table ----
     heading("Round-by-round results")
     if hist:
-        table(["Round", "Lean", "Cycle", "Served", "Wrong", "Waste", "Lost",
-               "Upkeep", "Profit"],
+        def _va_cell(h):
+            ts = round_time_split(h)
+            return f"{va_summary(ts)[0]:.0f}%" if ts else "—"
+        table(["Round", "Lean", "Cycle", "Value-added", "Served", "Wrong", "Waste",
+               "Lost", "Upkeep", "Profit"],
               [[h["round"], f"{h['lean_score']:.0f}", f"{h['avg_cycle']:.0f}s",
-                f"{h['served']:.0f}", f"{h['defects']:.0f}", f"{h['waste']:.0f}",
-                f"{h['abandon_pct']:.0f}%", money(h["upkeep"]), money(h["profit"])]
-               for h in hist])
+                _va_cell(h), f"{h['served']:.0f}", f"{h['defects']:.0f}",
+                f"{h['waste']:.0f}", f"{h['abandon_pct']:.0f}%", money(h["upkeep"]),
+                money(h["profit"])]
+               for h in hist],
+              col_w=[0.08, 0.08, 0.09, 0.13, 0.09, 0.09, 0.09, 0.08, 0.12, 0.15])
         if len(hist) >= 2:                       # trend chart, kept on one page
             ch = 0.17
             ensure(ch + 0.02)
@@ -3230,6 +3520,49 @@ def build_report_pdf():
             S["y"] -= ch + 0.004
     else:
         para("No rounds played yet.", size=9, color=LGREY)
+
+    # ---- value-added vs waste time: first round vs the latest / completed one ----
+    if hist:
+        h_last = dentry or hist[-1]
+        vrows = [("Round 1", round_time_split(hist[0]))]
+        if h_last is not hist[0]:
+            vrows.append((f"Round {h_last['round']}", round_time_split(h_last)))
+        vrows = [(l, t) for l, t in vrows if t]
+        if vrows:
+            heading("Value-added vs waste — where each drink's time went",
+                    keep_with=0.20)
+            vh = 0.045 + 0.045 * len(vrows)
+            ensure(vh + 0.11)
+            # axes leave room on the left for row labels and below for the axis
+            # title; the legend is laid out as page text, so it can't collide
+            ax = S["fig"].add_axes([LEFT + 0.14, S["y"] - vh, RIGHT - LEFT - 0.14,
+                                    vh - 0.008])
+            used = value_time_draw(ax, vrows, fontsize=8, legend=False)
+            S["y"] -= vh + 0.048
+            colw = (RIGHT - LEFT) / 3.0
+            for i, part in enumerate(used):
+                if i % 3 == 0:
+                    ensure(0.018)
+                    rowy = S["y"]
+                    S["y"] -= 0.017
+                x = LEFT + (i % 3) * colw
+                S["fig"].add_artist(Rectangle((x, rowy - 0.0095), 0.012, 0.0085,
+                                              transform=S["fig"].transFigure,
+                                              facecolor=VT_COLORS[part],
+                                              edgecolor="none"))
+                text(x + 0.017, rowy, wrap(part, 7.4, indent=(RIGHT - LEFT)
+                                           - colw + 0.02)[0],
+                     fontsize=7.4, color=INK, va="top")
+            S["y"] -= 0.006
+            v0 = va_summary(vrows[0][1])
+            v1 = va_summary(vrows[-1][1])
+            para(f"Value-added share: {v0[0]:.0f}% in Round 1"
+                 + (f", {v1[0]:.0f}% in {vrows[-1][0]}" if len(vrows) > 1 else "")
+                 + f". Waste time per drink: {v0[1]:.0f}s"
+                 + (f" to {v1[1]:.0f}s" if len(vrows) > 1 else "")
+                 + ". Value-added = fruit, ice, blending and pouring; necessary = "
+                 "cup, blender set-up, shortest walk; everything else is waste.",
+                 size=8.6, color=GREY, italic=True, after=0.006)
 
     # ---- round journal: decisions → prediction → coach, once per round ----
     heading("Round journal — decisions, predictions and coach diagnoses",
@@ -3345,6 +3678,24 @@ with st.sidebar:
         else:
             st.caption("✅ Plan committed — press **DO** to run the rush.")
 
+    # ---- 🎯 objectives tracker: always visible, on every page ----
+    st.divider()
+    _sres, _scfg = st.session_state.last_result, st.session_state.last_cfg
+    if _sres is None or _scfg is None:
+        st.markdown("**🎯 Objectives** — checked after each rush")
+        for _i, (_, _nm, _, _) in enumerate(objective_defs(), 1):
+            st.caption(f"⬜ {_i}. {_md_dollars(_nm)}")
+    else:
+        _so = objectives_status(_scfg, _sres)
+        _rows = objective_rows(_so, _sres)
+        st.markdown(f"**🎯 Objectives — {sum(r[0] for r in _rows)}/4 met** "
+                    f"(Round {st.session_state.history[-1]['round']})")
+        for _i, (_ok, _nm, _val, _) in enumerate(_rows, 1):
+            st.caption(f"{'✅' if _ok else '⬜'} {_i}. {_md_dollars(_nm)} — "
+                       f"{_md_dollars(_val)}")
+        if _debrief_entry() is not None:
+            st.caption("🎓 Core simulation complete — debrief unlocked.")
+
     # ---- Report & progress: ALWAYS here, whatever else the page is doing ----
     # This used to live only in an expander at the very bottom of the page, where
     # it was easy to miss and could be pushed around by the debrief. The sidebar
@@ -3435,7 +3786,10 @@ setInterval(jrPhase,300);jrPhase();
             "**Lean** means giving customers what they want with as little wasted "
             "effort as possible. Anything that doesn't add value — walking, "
             "waiting, mistakes, extra stock — is **waste**, and lean is the habit "
-            "of removing it.\n\nNo background needed. Each round hands you one "
+            "of removing it.\n\nSplit any drink's time into **value-added** (the "
+            "fruit, ice, blending and pouring the customer pays for) and "
+            "**waste** (everything else) — the ⏱️ chart after each rush shows the "
+            "split.\n\nNo background needed. Each round hands you one "
             "tool, you try it, and you watch the numbers move. Watch three: "
             "**cycle time**, **customers lost**, and **profit**.")
 
@@ -3449,6 +3803,11 @@ setInterval(jrPhase,300);jrPhase();
 
     with st.expander("Mini-glossary"):
         st.markdown(
+            "- **Value-added** – work the customer would pay for (fruit, ice, "
+            "blending, pouring).\n"
+            "- **Necessary non-value-added** – no value, but unavoidable for now "
+            "(grabbing a cup, blender set-up).\n"
+            "- **Waste** – everything else: waiting, searching, extra walking…\n"
             "- **Cycle time** – total wait, order to drink.\n"
             "- **WIP** – drinks in progress at once (clutter).\n"
             "- **5S** – Sort, Set-in-order, Shine, Standardize, Sustain.\n"
@@ -3604,6 +3963,9 @@ def render_rounds_page():
         "Profit $": round(h["profit"]), "Served": round(h["served"]),
         "Wrong": round(h["defects"]), "Waste": round(h["waste"]),
         "Lost %": round(h["abandon_pct"]),
+        "Value-added %": (round(h["va_pct"]) if h.get("va_pct") is not None
+                          else round(va_summary(round_time_split(h))[0])
+                          if round_time_split(h) else None),
         "Objectives": "✅" if h.get("all_ok") else "—",
         "Decisions": h.get("decisions", ""),
     } for h in hist]), hide_index=True, use_container_width=True)
@@ -3645,6 +4007,12 @@ def render_rounds_page():
             else:
                 st.markdown("**Your diagnosis:** *not answered yet*")
 
+        _ts = round_time_split(h)
+        if _ts:
+            _rows = ([("Round 1 (the shop you inherited)", round_time_split(hist[0]))]
+                     if idx > 0 else [])
+            _rows.append((f"Round {pick}", _ts))
+            show_value_time(_rows)
         if h.get("cdict"):
             st.markdown("**Decisions run this round**")
             st.dataframe(_decision_table(h["cdict"]), hide_index=True,
@@ -3704,11 +4072,10 @@ def render_debrief_page():
     dentry = _debrief_entry()
     st.header("🎓 Debrief — make sense of the whole game")
     if dentry is None:
-        st.info("🔒 The debrief unlocks when one rush meets **all four "
-                "objectives**: every waste worth addressing addressed, Lean Score ≥ "
-                f"{LEAN_TARGET}, a profit, and no spending that fails to pay for "
-                "itself. Your latest rush's checklist is in **CHECK** on the "
-                "Simulation page.")
+        st.info("🔒 The debrief unlocks when **one rush meets all four "
+                "objectives**. Your latest rush's checklist is in **CHECK** on the "
+                "Simulation page and in the sidebar.")
+        render_objective_defs()
         st.button("◀  Back to the simulation", type="primary", key="db_back_locked",
                   on_click=_go, args=("sim",))
         return
@@ -3743,6 +4110,24 @@ def render_debrief_page():
     if big_round and big_delta > 0:
         st.info(f"📈 Your biggest single-round jump was **+{big_delta:.0f} Lean "
                 f"points in Round {big_round}**, when you ran: *{big_dec}*.")
+
+    # ---- value-added vs waste: the whole journey in one picture ----
+    st.markdown("### ⏱️ Value-added vs waste — where each drink's time went")
+    _t0, _t1 = round_time_split(hist[0]), round_time_split(dentry)
+    if _t0 and _t1:
+        show_value_time([("Round 1 — the shop you inherited", _t0),
+                         (f"Round {dentry['round']} — your lean shop", _t1)])
+        _v0, _w0, _, _ = va_summary(_t0)
+        _v1, _w1, _b1, _bs1 = va_summary(_t1)
+        st.markdown(
+            f"Value-added share went from **{_v0:.0f}%** to **{_v1:.0f}%**, and waste "
+            f"time per drink from **{_w0:.0f}s** to **{_w1:.0f}s**. Notice the "
+            "value-added work itself barely changes — the drink still needs its "
+            "fruit, ice and blend. **Lean doesn't make the value-added work faster; "
+            "it strips away everything around it.**"
+            + (f" The biggest waste left is **{_b1.split(' (')[0].lower()} "
+               f"({_bs1:.0f}s)** — in a real shop, that's where the next kaizen "
+               "would start." if _b1 and _bs1 >= 1 else ""))
 
     # ---- how each of the 7 wastes was tackled ----
     st.markdown("### 📋 How you tackled each of the 7 wastes")
@@ -3939,11 +4324,14 @@ if st.session_state.page == "sim":
                   "stamped **INCOMPLETE** until they are done. Play to *learn the ideas*, "
                   "not just to hit the numbers.\n"
                 + "- ▶️ **How each round works:** run the rush → read what went wrong → "
-                  "answer the coach → change one decision → run again, until you've "
-                  "addressed all seven wastes with a solid Lean Score and a profit.\n"
+                  "answer the coach → change one decision → run again, until one "
+                  "rush meets **all four objectives** below.\n"
                 + "- 🧭 **Pages (buttons at the top):** *Simulation* · *Past rounds* "
                   "(review any earlier rush, copy its decisions, or rewind to it) · "
                   "*Debrief* · *Report*. Your answers are kept when you switch pages.")
+            st.markdown("**🎯 The four objectives** — tracked in the sidebar after "
+                        "every rush:")
+            render_objective_defs()
 
     st.markdown(f"🏪 {SC['briefing']}")
     st.subheader(plan["title"])
@@ -4010,6 +4398,26 @@ if st.session_state.page == "sim":
                    "across the simulated rushes — standard work shrinks this spread "
                    "(see the *Variability* tab).")
 
+        # ---------- value-added vs waste time ----------
+        _va, _wsec, _big, _bigsec = va_summary(res.time_split)
+        st.markdown(f"#### ⏱️ Value-added vs waste — **{_va:.0f}%** of each drink's "
+                    "time adds value")
+        _vrows = []
+        if prev is not None:
+            _vrows.append((f"Round {prev['round']}", round_time_split(prev)))
+        _vrows.append((f"Round {hist[-1]['round']} (this rush)", res.time_split))
+        show_value_time(_vrows)
+        st.caption(
+            "🟢 **Value-added** = the work a customer pays for (fruit, ice, blending, "
+            "pouring). ⚪ **Necessary** = adds no value but can't be avoided yet "
+            "(grab a cup, set up the blender, the shortest walk). 🟠🔴 **Waste** = "
+            f"everything else — **{_wsec:.0f}s per drink** this rush."
+            + (f" Biggest: **{_big.split(' (')[0].lower()} ({_bigsec:.0f}s)** → "
+               f"fix it in *{VT_FIX.get(_big, '')}*." if _big and _bigsec >= 1 else "")
+            + " Made-ahead drinks show little value-added time here because that "
+            "work happened before the order — their cost shows up as Overproduction "
+            "and Inventory waste instead.")
+
         # ---------- was your PLAN·commit prediction correct? ----------
         _pred, _right, _fact = prediction_verdict(len(hist) - 1)
         if _pred and _fact:
@@ -4031,19 +4439,19 @@ if st.session_state.page == "sim":
         _obj_met = sum([_obj["wastes_ok"], _obj["score_ok"], _obj["profit_ok"],
                         _obj["spend_ok"]])
         _wrows = _obj["waste_rows"]
-        st.markdown(
-            f"**🎯 Objectives to complete the simulation ({_obj_met}/4 met)**  \n"
-            f"{'✅' if _obj['wastes_ok'] else '⬜'} Every waste worth addressing is "
-            f"addressed — **{_done}/{_total}**  \n"
-            f"{'✅' if _obj['score_ok'] else '⬜'} Lean Score ≥ {LEAN_TARGET} — "
-            f"**{res.lean_score:.0f}**  \n"
-            f"{'✅' if _obj['profit_ok'] else '⬜'} Running a profit (> \\$0) — "
-            f"**\\${res.profit:.0f}**  \n"
-            f"{'✅' if _obj['spend_ok'] else '⬜'} Every dollar you spend earns its "
-            f"keep — **{len(_wrows)}** purchase"
-            f"{' is' if len(_wrows) == 1 else 's are'} not paying for "
-            f"{'itself' if len(_wrows) == 1 else 'themselves'}")
+        st.markdown(f"#### 🎯 Objectives — {_obj_met} of 4 met in this rush")
+        st.caption("All four must be true **in the same rush** to finish the core "
+                   "simulation and unlock the debrief.")
+        _lines = []
+        for _i, (_ok, _nm, _val, _how) in enumerate(objective_rows(_obj, res), 1):
+            _lines.append(f"{'✅' if _ok else '⬜'} **{_i}. {_md_dollars(_nm)}** — "
+                          f"{_md_dollars(_val)}"
+                          + ("" if _ok else
+                             f"  \n&nbsp;&nbsp;&nbsp;&nbsp;*How:* {_md_dollars(_how)}"))
+        st.markdown("  \n".join(_lines))
         st.progress(_obj_met / 4.0)
+        with st.expander("What exactly does each objective mean?"):
+            render_objective_defs()
         if _obj["all_ok"] or _debrief_entry() is not None:
             with st.container(border=True):
                 if st.session_state.pop("just_completed", False):
@@ -4059,11 +4467,13 @@ if st.session_state.page == "sim":
         if not _obj["all_ok"]:
             if not _obj["wastes_ok"]:
                 with st.expander("Which wastes are still left?", expanded=True):
-                    st.caption("A waste ticks when its counter-measure is in place — "
-                               "**or** when nothing available for it would pay for "
-                               "itself here. Not spending is a real lean decision.")
+                    st.caption("✅ counter-measure in place · ⬜ still to do · ➖ a "
+                               "*paid* fix that wouldn't pay for itself in your shop "
+                               "even with the free fixes made — leaving it alone is "
+                               "a real lean decision. Free fixes (line order, "
+                               "one-piece flow) are never excused.")
                     for nm, ok, note in _items:
-                        st.markdown(f"{'✅' if ok else '⬜'} {nm}"
+                        st.markdown(f"{'⬜' if not ok else ('➖' if note else '✅')} {nm}"
                                     + (f"  \n&nbsp;&nbsp;&nbsp;*{note}*" if note else ""))
             if _wrows:
                 with st.expander("Which spending isn't earning its keep?",
@@ -4196,11 +4606,14 @@ if st.session_state.page == "sim":
                        "to unlock the **DO** button in the **sidebar**.")
             st.markdown("**1. Target condition** — where you're headed:  \n"
                         "*A lean, profitable shop — serve nearly everyone, few wrong "
-                        "drinks, little waste: a high Lean Score with healthy profit.*")
+                        "drinks, little waste, and as much of each drink's time as "
+                        "possible spent on value-added work: a high Lean Score with "
+                        "healthy profit.*")
             st.markdown(f"**2. Actual condition now** — the facts this rush:  \n"
                         f"*Lean Score {_res.lean_score:.0f}/100 · served "
                         f"{_res.served:.0f}/{_res.arrivals:.0f} · {_res.defects:.0f} wrong "
-                        f"· {_res.waste:.0f} wasted · {_res.abandon_pct:.0f}% walked out.*")
+                        f"· {_res.waste:.0f} wasted · {_res.abandon_pct:.0f}% walked out "
+                        f"· only {_res.va_pct:.0f}% of each drink's time is value-added.*")
             st.markdown(
                 f"""<div id='jr-coachq' class='jr-ask{' done' if _answered else ''}'>
       <div class='jr-ask-tag'>{'✅ Answered — step 1 complete'
@@ -4305,6 +4718,17 @@ if st.session_state.page == "sim":
         return st.expander(f"{_badge}{title}   ·   {five_s_tag}   ·   💲 {cost_txt}",
                            expanded=exp)
 
+    def _vt_note(*parts):
+        """'This decision fights N seconds of waste per drink' — from the last rush."""
+        _r = st.session_state.last_result
+        if _r is None or not _r.time_split:
+            return
+        secs = sum(_r.time_split.get(p, 0.0) for p in parts)
+        names = " + ".join(p.split(" (")[0].lower() for p in parts)
+        st.caption(f"⏱️ **Waste time this decision removes:** {names} cost "
+                   f"**{secs:.0f}s of every drink** in your last rush "
+                   f"(value-added work was {_r.time_split.get('Value-added', 0):.0f}s).")
+
 
     st.markdown("<div id='jr-plan'></div>", unsafe_allow_html=True)
     st.markdown("### 🛠️ PLAN — make your decisions (one per waste)")
@@ -4353,6 +4777,7 @@ if st.session_state.page == "sim":
             with _dec("transport", "🚚 **Transport** — drinks carried around the shop",
                       "5S #2 Set in order", tcost):
                 layout_editor()
+                _vt_note("Extra walking (Transport)")
                 st.divider()
                 C["conveyor"] = st.toggle(
                     f"🛝 Conveyor belt between stations (${sim.LEAN_COSTS['conveyor']:.0f}"
@@ -4376,6 +4801,7 @@ if st.session_state.page == "sim":
                 fcost = sim.FIVE_S_COST.get(C["five_s"], 0.0)
                 st.caption(f"**{C['five_s']}** — {sim.FIVE_S_DESC[C['five_s']]}  ·  "
                            f"**${fcost:.0f}/rush**.")
+                _vt_note("Searching (Motion)")
 
         # 4. Overprocessing  →  5S #4 Standardize
         if "overprocessing" in dec_unlocked:
@@ -4392,6 +4818,7 @@ if st.session_state.page == "sim":
                 C["standard_level"] = snames.index(spick)
                 sl = sim.STANDARD_LEVELS[C["standard_level"]]
                 st.caption(f"**{sl['name']}** — {sl['desc']}  ·  ${sl['cost']:.0f}/rush.")
+                _vt_note("Extra finishing steps (Overprocessing)")
 
         # 5. Inventory  →  5S #5 Sustain
         if "inventory" in dec_unlocked:
@@ -4402,9 +4829,9 @@ if st.session_state.page == "sim":
                       "5S #5 Sustain", icost):
                 st.caption("Three ways to control inventory: **(a) one-piece flow** "
                            "(batch 1, no pre-made) — free, keeps stock low; **(b) FIFO "
-                           "rotation** ($1/rush) — a use-oldest-first rule that keeps "
+                           "rotation** (\\$1/rush) — a use-oldest-first rule that keeps "
                            "whatever stock you hold *fresh*, so far less spoils; "
-                           "**(c) pull replenishment** ($3/rush) — kanban that restocks "
+                           "**(c) pull replenishment** (\\$3/rush) — kanban that restocks "
                            "only what's used. Start with (a); add (b) or (c) only if "
                            "stock is still a problem — don't pay for what you don't need.")
                 C["fifo"] = st.toggle("FIFO rotation (use oldest stock first)",
@@ -4441,6 +4868,7 @@ if st.session_state.page == "sim":
                       "Capacity at the bottleneck", f"${wcost:.0f}/rush"):
                 st.caption("Add people/equipment **only at the station that's backed "
                            "up** — capacity costs money every rush. Test it first!")
+                _vt_note("Waiting in line (Waiting)", "Slow station & crowding")
                 C["mode"] = st.radio("Staffing model",
                                      ["Whole-order", "Specialized stations"],
                                      index=0 if C["mode"] == "Whole-order" else 1)
@@ -4522,14 +4950,16 @@ if st.session_state.page == "sim":
                     cache = (sig, dict(name="; ".join(chg)[:90], added_cost=0,
                                        d_profit=_pd.profit - _bd.profit,
                                        d_score=_pd.lean_score - _bd.lean_score,
-                                       d_served=_pd.served - _bd.served))
+                                       d_served=_pd.served - _bd.served,
+                                       d_va=_pd.va_pct - _bd.va_pct))
                     st.session_state.dryrun_cache = cache
                     st.session_state.tested = [c for c in st.session_state.tested
                                                if c.get("added_cost") != 0] + [cache[1]]
                 _t = cache[1]
                 good = _t["d_profit"]
                 st.markdown(f"**Dry-run preview:** profit **{good:+.0f}\\$**, served "
-                            f"{_t['d_served']:+.0f}, Lean **{_t['d_score']:+.0f}** "
+                            f"{_t['d_served']:+.0f}, Lean **{_t['d_score']:+.0f}**, "
+                            f"value-added share **{_t.get('d_va', 0):+.0f} pts** "
                             "*vs the last rush.*")
                 if good > 3:
                     st.success("👍 Looks worth it — commit your plan below.")
@@ -4629,6 +5059,8 @@ if st.session_state.page == "sim":
                     arrivals=res.arrivals, defects=res.defects, waste=res.waste,
                     abandon_pct=res.abandon_pct, avg_wip=res.avg_wip,
                     walk_units=res.walk_units, profit=res.profit, upkeep=res.upkeep,
+                    va_pct=res.va_pct,
+                    tsplit={k: round(v, 2) for k, v in res.time_split.items()},
                     decisions=", ".join(decisions))
 
 

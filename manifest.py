@@ -4,6 +4,7 @@ MANIFEST={"app_key":APP_KEY,"name":NAME,"schema_version":SCHEMA_VERSION,"params"
   "slow_mult_range":{"type":"list","default":[1.25,1.60],"group":"Scenario","label":"Bottleneck slowdown range"},
   "demand_mix":{"type":"list","default":["Light","Normal","Normal","Slammed"],"group":"Scenario","label":"Rush intensity pool"},
   "demand_mult_range":{"type":"list","default":[0.90,1.15],"group":"Scenario","label":"Demand multiplier range"},
+  "slammed_demand_mult_max":{"type":"float","default":1.00,"min":0.5,"group":"Scenario","label":"Max demand multiplier in a Slammed rush"},
   "patience_choices":{"type":"list","default":[120,135,150,170,190],"group":"Scenario","label":"Customer patience (s)"},
   "defect_base_range":{"type":"list","default":[0.12,0.20],"group":"Scenario","label":"Baseline defect range"},
   "start_batch_choices":{"type":"list","default":[2,3,4],"group":"Scenario","label":"Inherited batch sizes"},

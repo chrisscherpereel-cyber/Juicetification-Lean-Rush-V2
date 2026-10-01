@@ -102,20 +102,61 @@ monotonically along the improvement path, so every genuine change is visible.
 
 ---
 
-## Finishing — the three objectives
+## Value-added vs waste
 
-The core simulation is complete only when **all three** are true:
+Every second of a drink's lead time (order → hand-off) is measured inside the
+simulation and sorted into three kinds:
 
-- ✅ **Every waste worth addressing is addressed** — each has its counter-measure
-  decision in place, *or* nothing available for that waste would pay for itself in
-  this shop, in which case leaving it alone is itself the lean decision
-- ✅ **Lean Score ≥ 70**
-- ✅ **Running a profit** (> $0)
+- **Value-added** — work the customer pays for: adding fruit and ice, blending,
+  pouring and finishing.
+- **Necessary non-value-added** — no value, but unavoidable with today's process:
+  grabbing a cup, blender set-up, the shortest possible walk.
+- **Waste** — everything else: searching (Motion), extra walking (Transport),
+  extra finishing steps (Overprocessing), a slow or crowded station, and waiting
+  in line (Waiting).
 
-A live "Objectives (x/3)" panel shows exactly what is still missing. There is no
-round-count shortcut — the number of rounds is however many the student needs.
-Both thresholds sit well below what a well-run shop reaches in every random
-scenario, so the goal is always achievable.
+A stacked bar chart of this split appears after every rush (this round vs the last),
+on the Past rounds page, in the debrief (Round 1 vs the finished shop) and in the
+PDF report, with the value-added share as a headline number. Each time-wasting
+decision shows how many seconds of waste it is fighting, the PLAN dry-run reports
+the change in value-added share, and the knowledge check includes a question on it.
+The usual lesson emerges on its own: the value-added work barely changes — lean
+shortens the lead time by stripping away the waste around it. (Overproduction and
+Inventory are stock wastes rather than time wastes, so they show up in the waste
+and spoilage figures instead.)
+
+---
+
+## Finishing — the four objectives
+
+The core simulation is complete when **one rush meets all four objectives at the
+same time**. The same four lines are shown in the orientation panel, in a tracker
+in the sidebar (every page, updated after each rush), in the CHECK panel (with a
+*How:* hint under each one not yet met), on the locked Debrief page and in the
+PDF report:
+
+1. **Fix every waste worth fixing** — each of the 7 wastes has its counter-measure
+   in place. A *paid* fix (5S, standard work, visual signals, extra capacity) can
+   be skipped when it wouldn't pay for itself in the student's shop even with the
+   free fixes made — shown as ➖ "not worth fixing here" and re-checked every
+   rush. Free fixes (line order, one-piece flow) can never be skipped. The tracker
+   reports this as e.g. "4 fixed · 1 not worth fixing here · 2 to do".
+2. **Lean Score of 70 or more** — the 0–100 composite of correct service, quality,
+   speed, flow and (weighted most) low waste.
+3. **Make a profit** — revenue minus every cost, including the per-rush cost of
+   the improvements.
+4. **No wasted spending** — every paid choice pays for itself: taking it back one
+   step must not make the shop more than $2/rush richer.
+
+Objectives 1 and 4 use the same ±$2/rush break-even band — a fix is only
+*required* when it clearly gains more than $2, and a purchase is only *flagged*
+when it clearly loses more than $2 — so simulation noise can't make one purchase
+required by one rule and wasted by the other.
+
+There is no round-count shortcut. The Lean Score and profit targets are
+instructor-configurable (`lean_target`, `profit_target` in the Director).
+Finishability was verified offline across the full range of random scenarios
+the defaults can generate (see *Design notes*).
 
 ---
 
@@ -154,7 +195,8 @@ it. Once the objectives are met, the **Debrief** page opens with:
 - the **lean priority ladder** — the general rule their game just demonstrated;
 - **four written reflections** (biggest lever, what wasn't worth it, prediction
   accuracy, and transfer to a real process);
-- a **seven-question knowledge check** with instant feedback and a score.
+- the **value-added vs waste** comparison of Round 1 and the finished shop;
+- an **eight-question knowledge check** with instant feedback and a score.
 
 **The PDF report can be downloaded at any time after the first round, and its
 first page says plainly whether it is COMPLETE or INCOMPLETE** — an incomplete one
@@ -251,6 +293,15 @@ so a deployment that leaves storage unconfigured still runs without using them.
 ---
 
 ## Design notes
+
+- **Every scenario is finishable.** Verified offline with the real engine and the
+  app's own objective functions: all 144 extreme combinations of the scenario
+  ranges (demand level × slow station × slowdown × demand surge × patience ×
+  error rate) plus 36 scenarios from the real generator each have a shop that
+  meets all four objectives on 10 out of 10 rush seeds. This required one
+  balance change: a **Slammed** rush no longer also draws a demand surge above
+  ×1.00 (`slammed_demand_mult_max`, instructor-configurable); before it, the
+  worst combination topped out at Lean 74 and failed 1 seed in 10.
 
 - **Discrete-event engine** — a heapq scheduler with non-homogeneous Poisson
   arrivals (thinning), customer patience/abandonment, station contention, and
