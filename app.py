@@ -1111,7 +1111,8 @@ DONE_PLAN = {"unlock": GROUPS, "concept": "Kaizen — complete",
              "focus": "You've addressed every waste worth addressing, with a "
                       "high Lean Score, a "
                       "healthy profit, and no spending that fails to pay for "
-                      "itself. Scroll down to your **debrief**; keep "
+                      "itself. Open the **🎓 Debrief** page (buttons at the "
+                      "top); keep "
                       "experimenting here if you'd like.",
              "why": "You met all four objectives — waste, quality/flow, profit, "
                     "and spending that earns its keep."}
@@ -1370,6 +1371,48 @@ DEBRIEF_QUIZ = [
                 "just multiplies the queue — fix the flow first, then fill it."},
 ]
 
+# The four written debrief reflections: (id, prompt, placeholder).
+DEBRIEF_QS = [
+    ("biggest_lever",
+     "1. Which single change moved your Lean Score the most — and *why* did that "
+     "one do so much?",
+     "e.g., putting the stations in order removed all the backtracking…"),
+    ("not_worth_it",
+     "2. Did any change cost more than it returned? Which, and how did you know it "
+     "wasn't worth it?",
+     "e.g., the top visual-signal tier — Δ profit was negative in test…"),
+    ("prediction",
+     "3. When you committed a prediction before each rush, was it usually right? "
+     "What did a *wrong* prediction teach you?",
+     "e.g., I thought a 2nd blender would help but the bottleneck was…"),
+    ("transfer",
+     "4. Transfer: pick a real process (a café, clinic, office, your email). Which "
+     "2 of the 7 wastes does it suffer from, and what's the cheapest first "
+     "countermeasure?",
+     "e.g., my clinic's check-in has Waiting and Motion because…"),
+]
+
+
+def _quiz_options(qi):
+    """Answer options for knowledge-check item qi, shuffled stably per scenario."""
+    opts = list(DEBRIEF_QUIZ[qi]["options"])
+    _random.Random(f"{st.session_state.scenario['sid']}-quiz-{qi}").shuffle(opts)
+    return opts
+
+
+def debrief_status():
+    """(# reflections written, # quiz answered, # quiz correct, all done?)."""
+    refl = sum(1 for qid, _, _ in DEBRIEF_QS
+               if str(_ans(f"debrief_{qid}", "")).strip())
+    answered = correct = 0
+    for qi, qz in enumerate(DEBRIEF_QUIZ):
+        a = _ans(f"dquiz_{qi}")
+        if a is not None:
+            answered += 1
+            correct += int(a == qz["answer"])
+    done = refl >= len(DEBRIEF_QS) and answered >= len(DEBRIEF_QUIZ)
+    return refl, answered, correct, done
+
 
 # --------------------------------------------------------------------------
 # Randomised, unique-but-solvable scenario for each session
@@ -1446,7 +1489,8 @@ def _init_state(new_seed=None):
         st.session_state.baseline = {}
         st.session_state.tested = []          # student-tested decisions (Socratic)
         st.session_state.staged = []          # changes implemented for next rush
-        st.session_state.reflections = {}     # captured Socratic answers
+        st.session_state.answers = {}         # every student answer, by widget key
+        st.session_state.page = "sim"         # sim / rounds / debrief / report
         st.session_state.student = ""
         st.session_state.order_nonce = 0      # bumps to refresh the drag widget
         st.session_state.coach_q = {}         # cached coach question per round
@@ -1455,9 +1499,11 @@ def _init_state(new_seed=None):
 
 # ---- progress persistence (student_store) -----------------------------------
 # Only these session-state keys are persisted/resumed. Transient objects
-# (last_result, last_cfg, baseline), figures, RNGs and widget keys are excluded.
+# (last_result, last_cfg, baseline), figures and RNGs are excluded. Widget values
+# are NOT saved directly: Streamlit discards a widget's state whenever it isn't
+# drawn (e.g. on another page), so every answer is mirrored into `answers`.
 PROGRESS_KEYS = ["round", "history", "cfg", "scenario", "game_mode",
-                 "reflections", "tested", "staged", "coach_q", "asked_coach",
+                 "tested", "staged", "coach_q", "asked_coach", "answers", "page",
                  "goal_reached_once", "student", "last_cdict", "last_seed"]
 
 
@@ -1505,6 +1551,28 @@ def _restore_progress(saved):
         elif k == "coach_q" and isinstance(v, dict):
             v = {int(rk): rv for rk, rv in v.items()}   # JSON stringified int keys
         st.session_state[k] = v
+    if "answers" not in saved:            # progress saved by an older version
+        st.session_state.answers = _answers_from_legacy(saved.get("reflections") or {})
+
+
+def _answers_from_legacy(refl):
+    """Older saves kept answers as report text in `reflections`; recover them."""
+    ans = {}
+    for k, v in refl.items():
+        a = (v or {}).get("a", "")
+        if k.startswith("R") and k.endswith(" coach"):
+            ans[f"coachmc_{k[1:-6]}"] = (a.removeprefix("chose: ")
+                                         .split("  ✓")[0].split("  [")[0])
+            if "[asked for help]" in a:
+                ans[f"helped_{k[1:-6]}"] = True
+        elif k.startswith("R") and k.endswith(" plan prediction"):
+            ans[f"plancommit_{k[1:-16]}"] = a
+        elif k.startswith("Debrief · "):
+            ans[f"debrief_{k[len('Debrief · '):]}"] = a
+        elif k.startswith("Knowledge check · Q"):
+            qi = int(k.rsplit("Q", 1)[1]) - 1
+            ans[f"dquiz_{qi}"] = a.rsplit("  [", 1)[0]
+    return ans
 
 
 def _autosave():
@@ -1529,7 +1597,8 @@ def _clear_transient_state():
     Restart truly starts clean (no stale answers, no report left unlocked)."""
     _pfx = ("coachmc_", "plancommit_", "helped_", "dquiz_", "debrief_",
             "roibtn_", "order_dnd_", "buy_")
-    _flags = {"dryrun_cache", "roirows", "goal_reached_once", "debrief_ready",
+    _flags = {"dryrun_cache", "roirows", "goal_reached_once", "_rr_cache",
+              "report_pdf", "report_complete",
               "_completion_recorded", "_last_saved_sig", "last_cdict", "last_seed"}
     for k in list(st.session_state.keys()):
         if k in _flags or k.startswith(_pfx):
@@ -1544,6 +1613,8 @@ if store.enabled() and sid and not st.session_state.get("_restored"):
     if _saved:
         _restore_progress(_saved)
     st.session_state["_restored"] = True
+st.session_state.setdefault("answers", {})
+st.session_state.setdefault("page", "sim")
 C = st.session_state.cfg
 SC = st.session_state.scenario
 
@@ -1995,6 +2066,144 @@ def run_sim(cfg, base_seed=1234):
 # on screen. RESULT_MISSING is True only when a rush was run and could not be
 # rebuilt; nothing is ever gated on a question that isn't showing.
 RESULT_MISSING = bool(st.session_state.get("history")) and not recover_last_result()
+
+
+# ---- answers that survive page switches and logins ---------------------------
+def _ans(key, default=None):
+    """A student's answer: the live widget value if drawn this run, else the
+    saved copy (the widget may be on another page, or this is a resumed login)."""
+    v = st.session_state.get(key)
+    return v if v not in (None, "") else st.session_state.answers.get(key, default)
+
+
+def _bind(key, options=None):
+    """Seed a widget from the saved answer before drawing it, so it reappears
+    filled in after a page switch or a new login. Returns the key."""
+    saved = st.session_state.answers.get(key)
+    if (key not in st.session_state and saved not in (None, "")
+            and (options is None or saved in options)):
+        st.session_state[key] = saved
+    return key
+
+
+def _keep(key):
+    """Mirror a widget's current value into the saved answers."""
+    v = st.session_state.get(key)
+    if v in (None, ""):
+        st.session_state.answers.pop(key, None)
+    else:
+        st.session_state.answers[key] = v
+
+
+def _go(page):
+    """Navigation callback: switch page and land at the top of it."""
+    st.session_state.page = page
+    st.session_state.scroll_top = True
+
+
+def _entry_cfg_res(h):
+    """(Config, RoundResult) for any past round, rebuilt deterministically from
+    the decisions + seed saved with it (cached for the session)."""
+    hist = st.session_state.history
+    if (hist and h is hist[-1] and st.session_state.get("last_result") is not None):
+        return st.session_state.last_cfg, st.session_state.last_result
+    if h.get("cdict") is None:
+        return None, None
+    key = (h["round"], json.dumps(_jsonable(h["cdict"]), sort_keys=True), h.get("seed"))
+    cache = st.session_state.setdefault("_rr_cache", {})
+    if key not in cache:
+        c = cfg_from_state(_migrate_cfg_dict(dict(h["cdict"]), _BASELINE_KEYS))
+        cache[key] = (c, run_sim(c, base_seed=h.get("seed", 1000)))
+    return cache[key]
+
+
+def prediction_verdict(idx):
+    """(prediction, came_true, fact) for history[idx]: True/False, or None for an
+    open-ended experiment / no earlier round to compare against."""
+    hist = st.session_state.history
+    h = hist[idx]
+    pred = _ans(f"plancommit_{h['round']}")
+    if not pred or idx == 0:
+        return pred, None, ""
+    prev = hist[idx - 1]
+    dS = h["lean_score"] - prev["lean_score"]
+    dP = h["profit"] - prev["profit"]
+    fact = f"Lean {dS:+.0f}, profit {dP:+.0f}$"
+    if "BOTH" in pred:
+        right = dS > 0 and dP > 0
+    elif "even if profit dips" in pred:
+        right = dS > 0
+    elif "re-running" in pred:
+        right = abs(dS) <= 2 and abs(dP) <= 5
+    else:                                   # "it might backfire" — always a win
+        right = None
+    return pred, right, fact
+
+
+def _debrief_entry():
+    """The most recent round whose shop met all the objectives (it unlocks the
+    debrief, and stays unlocked even if later free-play experiments slip)."""
+    hist = st.session_state.history
+    for h in reversed(hist):
+        if h.get("all_ok"):
+            return h
+    if hist and not any("all_ok" in h for h in hist):   # saved by an older version
+        if st.session_state.get("goal_reached_once"):
+            return hist[-1]
+        c, r = _entry_cfg_res(hist[-1])
+        if r is not None and objectives_status(c, r)["all_ok"]:
+            return hist[-1]
+    return None
+
+
+def _round_index(key, prefix):
+    """Round number encoded in an answer key like 'coachmc_3', else None."""
+    tail = key[len(prefix):] if key.startswith(prefix) else ""
+    return int(tail) if tail.isdigit() else None
+
+
+def _drop_decision_widgets():
+    """Forget decision widgets that keep their own state (the catalogue toggles),
+    so a restored plan is drawn from the restored decisions."""
+    for k in list(st.session_state.keys()):
+        if k.startswith("buy_"):
+            st.session_state.pop(k, None)
+    st.session_state.order_nonce += 1
+
+
+def _rewind_to(n):
+    """Callback: go back to just after Round n ran — drop the later rounds and
+    their answers, and restore Round n's decisions as the plan to revise."""
+    ss = st.session_state
+    idx = next(i for i, h in enumerate(ss.history) if h["round"] == n)
+    h = ss.history[idx]
+    ss.history = ss.history[:idx + 1]
+    ss.round = n + 1
+    ss.cfg = copy.deepcopy(h["cdict"])
+    ss.last_cdict = copy.deepcopy(h["cdict"])
+    ss.last_seed = h.get("seed", 1000 + n)
+    ss.last_result = ss.last_cfg = None     # rebuilt from last_cdict on rerun
+    # coach answers/help and plan commits for the undone rounds are removed
+    for k in list(ss.answers.keys()) + list(ss.keys()):
+        for pfx in ("coachmc_", "helped_", "plancommit_"):
+            r = _round_index(k, pfx)
+            if r is not None and r > n:
+                ss.answers.pop(k, None)
+                ss.pop(k, None)
+    ss.coach_q = {r: q for r, q in ss.coach_q.items() if r <= n}
+    ss.goal_reached_once = any(x.get("all_ok") for x in ss.history)
+    for k in ("dryrun_cache", "roirows", "report_pdf", "report_complete"):
+        ss.pop(k, None)
+    _drop_decision_widgets()
+    _go("sim")
+
+
+def _load_plan_from(n):
+    """Callback: copy Round n's decisions into the current plan (non-destructive)."""
+    h = next(x for x in st.session_state.history if x["round"] == n)
+    st.session_state.cfg = copy.deepcopy(h["cdict"])
+    _drop_decision_widgets()
+    _go("sim")
 
 # Everything the shop can switch ON that is not a tiered lean level: the flag on
 # Config, the name students see, and the state key that drives it.
@@ -2665,7 +2874,7 @@ def coach_mc(cfg, res, diag, allowed, asked):
 
 
 # --------------------------------------------------------------------------
-# LMS progress report (downloadable HTML + CSV)
+# LMS progress report (downloadable PDF)
 # --------------------------------------------------------------------------
 def report_status():
     """Is this a COMPLETE submission, and if not, what is still missing?
@@ -2675,19 +2884,18 @@ def report_status():
     PDF) exactly where it stands. Every piece is checked from the recorded
     answers themselves, so the verdict is the same whether or not the debrief
     section happens to be on screen."""
-    refl = st.session_state.get("reflections", {}) or {}
     hist = st.session_state.get("history", []) or []
-    n_refl = sum(1 for k in refl if str(k).startswith("Debrief"))
-    n_quiz = sum(1 for k in refl if str(k).startswith("Knowledge check"))
-    objectives_ok = bool(st.session_state.get("goal_reached_once"))
+    n_refl, n_quiz, _, _ = debrief_status()
+    objectives_ok = _debrief_entry() is not None
 
     missing = []
     if not hist:
         missing.append("no rounds played yet")
     if not objectives_ok:
         missing.append("the four simulation objectives are not all met yet")
-    if n_refl < 4:
-        missing.append(f"written reflections ({n_refl} of 4 answered)")
+    if n_refl < len(DEBRIEF_QS):
+        missing.append(f"written reflections ({n_refl} of {len(DEBRIEF_QS)} "
+                       "answered)")
     if n_quiz < len(DEBRIEF_QUIZ):
         missing.append(f"knowledge check ({n_quiz} of {len(DEBRIEF_QUIZ)} answered)")
     if not (st.session_state.get("student") or "").strip():
@@ -2700,40 +2908,84 @@ def report_status():
 
 def _report_context():
     hist = st.session_state.history
-    best = max((h["lean_score"] for h in hist), default=0)
     final = hist[-1]["lean_score"] if hist else 0
     first = hist[0]["lean_score"] if hist else 0
     base = baseline_ref(SC["demand"])
     final_profit = hist[-1]["profit"] if hist else base.profit
-    return dict(hist=hist, best=best, final=final, first=first,
-                gain=final - first, base=base, final_profit=final_profit,
+    return dict(hist=hist, final=final, first=first, base=base,
+                final_profit=final_profit,
                 improvement=final_profit - base.profit)
 
 
+def _report_journal():
+    """One entry per round, in play order: what was run, the prediction made for
+    it, and the coach diagnosis that followed it. Built from the saved answers, so
+    it always matches the rounds actually on record (no stale or repeated rows)."""
+    out = []
+    for i, h in enumerate(st.session_state.history):
+        r = h["round"]
+        pred, right, fact = prediction_verdict(i)
+        cq = st.session_state.coach_q.get(r)
+        choice = _ans(f"coachmc_{r}")
+        coach = None
+        if cq and choice:
+            best = cq["options"][cq["best"]]
+            coach = dict(q=cq["q"], a=choice, best=best, ok=choice == best,
+                         helped=bool(_ans(f"helped_{r}")))
+        out.append(dict(round=r, decisions=h.get("decisions") or "—", pred=pred,
+                        right=right, fact=fact, coach=coach))
+    return out
+
+
 def build_report_pdf():
-    """A clean, auto-paginating multi-page PDF report (no external libraries). A
-    small flowing-text engine tracks a vertical cursor and starts a fresh page
-    whenever a block wouldn't fit, so nothing is ever truncated or overlapped."""
+    """A clean, auto-paginating multi-page PDF report (no external libraries).
+
+    Layout rules that keep it overlap-free: every line is wrapped using the real
+    rendered width of the font, every block reserves its height before it is
+    drawn (starting a new page when it would not fit), long tables are split
+    across pages with the header repeated, '$' never triggers math mode, and
+    characters the PDF font cannot draw (e.g. emoji) are dropped."""
     import io as _io
-    import textwrap as _tw
+    import re as _re
     import datetime as _dt
     from matplotlib.backends.backend_pdf import PdfPages
+    from matplotlib.backends.backend_agg import RendererAgg
+    from matplotlib.font_manager import FontProperties, findfont
+    from matplotlib.ft2font import FT2Font
     from matplotlib.lines import Line2D
     from matplotlib.patches import FancyBboxPatch, Rectangle
+    from matplotlib.ticker import MaxNLocator
 
     ctx = _report_context()
-    refl = st.session_state.reflections
-    name = st.session_state.student or "(name not entered)"
+    hist = ctx["hist"]
+    name = st.session_state.student or sid or "(name not entered)"
     today = _dt.date.today().strftime("%B %d, %Y")
     status = report_status()
 
+    PAGE_W, PAGE_H = 8.5, 11.0
     LEFT, RIGHT, TOP, BOT = 0.09, 0.91, 0.90, 0.075
-    TEAL, DARK, GREY, LGREY, LINE = ("#2a9d8f", "#264653", "#5f6b6b",
-                                     "#9aa0a0", "#e2e6e6")
+    TEAL, DARK, GREY, LGREY, LINE, INK = ("#2a9d8f", "#264653", "#5f6b6b",
+                                          "#9aa0a0", "#e2e6e6", "#2c2c2c")
+    GOOD, BAD = "#2a9d8f", "#c0392b"
     AMBER, AMBER_DK = "#fdf0d5", "#9c6b15"
     S = {"fig": None, "y": TOP, "page": 0}
     buf = _io.BytesIO()
     pdf = PdfPages(buf)
+    # measure at high resolution: low-dpi font hinting under-reports widths
+    _MDPI = 720
+    _meas = RendererAgg(int(PAGE_W * _MDPI), int(PAGE_H * _MDPI), _MDPI)
+    _glyphs = set(FT2Font(findfont(FontProperties(family="DejaVu Sans")))
+                  .get_charmap())
+
+    def clean(s, md=True):
+        s = str(s if s is not None else "")
+        if md:                                   # app-authored markdown → plain
+            s = s.replace("\\$", "$").replace("**", "")
+            s = _re.sub(r"(?<!\w)\*(\S[^*]*?)\*(?!\w)", r"\1", s)
+        return "".join(c for c in s if c == "\n" or ord(c) in _glyphs)
+
+    def text(x, y, s, **kw):
+        return S["fig"].text(x, y, s, parse_math=False, **kw)
 
     def rule(y, color=LINE, lw=0.8, x0=LEFT, x1=RIGHT):
         S["fig"].add_artist(Line2D([x0, x1], [y, y], transform=S["fig"].transFigure,
@@ -2744,27 +2996,34 @@ def build_report_pdf():
             return
         f = S["fig"]
         rule(0.055)
-        _foot = "Juicetification: The Lean Rush"
+        foot = "Juicetification: The Lean Rush"
         if not status["complete"]:
-            _foot += "  ·  INCOMPLETE REPORT"
-        f.text(LEFT, 0.039, _foot, fontsize=7.5,
-               color=LGREY if status["complete"] else AMBER_DK)
-        f.text(RIGHT, 0.039, f"Page {S['page']}", fontsize=7.5, color=LGREY,
-               ha="right")
+            foot += "  ·  INCOMPLETE REPORT"
+        text(LEFT, 0.039, foot, fontsize=7.5,
+             color=LGREY if status["complete"] else AMBER_DK)
+        text(RIGHT, 0.039, f"Page {S['page']}", fontsize=7.5, color=LGREY,
+             ha="right")
         pdf.savefig(f)
         plt.close(f)
 
     def new_page():
         _finish_page()
-        f = plt.figure(figsize=(8.5, 11))
+        f = plt.figure(figsize=(PAGE_W, PAGE_H))
         f.patch.set_facecolor("white")
         S["fig"] = f
         S["page"] += 1
         S["y"] = TOP
         if S["page"] > 1:                        # running header on later pages
-            f.text(LEFT, 0.955, "Juicetification: The Lean Rush — Report",
-                   fontsize=9.5, color=TEAL, fontweight="bold")
-            f.text(RIGHT, 0.955, name, fontsize=8.5, color=GREY, ha="right")
+            title = "Juicetification: The Lean Rush — Student Report"
+            text(LEFT, 0.955, title, fontsize=9.5, color=TEAL, fontweight="bold")
+            # the student's name shares the header line: trim it so the two can
+            # never collide, however long the name is
+            room = ((RIGHT - LEFT) * PAGE_W * 72 * 0.96
+                    - _width(title, 9.5, True) - 18)
+            nm = clean(name, md=False)
+            while nm and _width(nm, 8.5, False) > room:
+                nm = nm[:-2] + "…"
+            text(RIGHT, 0.955, nm, fontsize=8.5, color=GREY, ha="right")
             rule(0.945)
             S["y"] = 0.925
         return f
@@ -2773,147 +3032,256 @@ def build_report_pdf():
         if S["y"] - dy < BOT:
             new_page()
 
-    def para(s, size=9.2, color="#2c2c2c", bold=False, italic=False,
-             indent=0.0, after=0.004, lh=None):
-        lh = lh or (size / 850.0 + 0.005)
-        # wrap width from real font metrics (8.5in page) so text never runs past
-        # the right margin, whatever the size / weight / indent.
-        charw = (size / 72.0 / 8.5) * (0.63 if bold else 0.57)
-        maxchars = max(12, int((RIGHT - LEFT - indent) / charw))
-        for line in (_tw.wrap(s, maxchars) or [""]):
+    def _width(s, size, bold):
+        prop = FontProperties(family="DejaVu Sans", size=size,
+                              weight="bold" if bold else "normal")
+        return (_meas.get_text_width_height_descent(s, prop, ismath=False)[0]
+                * 72.0 / _MDPI)
+
+    def wrap(s, size, bold=False, indent=0.0):
+        """Greedy word-wrap against the true rendered width (in points)."""
+        maxw = (RIGHT - LEFT - indent) * PAGE_W * 72 * 0.96   # safety margin
+        lines = []
+        for para_ in (s.split("\n") or [""]):
+            cur = ""
+            for word in para_.split():
+                while _width(word, size, bold) > maxw:          # overlong token
+                    cut = len(word)
+                    while cut > 1 and _width(word[:cut], size, bold) > maxw:
+                        cut -= 1
+                    if cur:
+                        lines.append(cur)
+                        cur = ""
+                    lines.append(word[:cut])
+                    word = word[cut:]
+                trial = f"{cur} {word}" if cur else word
+                if _width(trial, size, bold) <= maxw:
+                    cur = trial
+                else:
+                    lines.append(cur)
+                    cur = word
+            lines.append(cur)
+        return lines or [""]
+
+    def _lh(size):
+        return size / 850.0 + 0.005
+
+    def para_height(s, size=9.2, bold=False, indent=0.0, after=0.004):
+        return len(wrap(s, size, bold, indent)) * _lh(size) + after
+
+    def para(s, size=9.2, color=INK, bold=False, italic=False, indent=0.0,
+             after=0.004, md=True):
+        lh = _lh(size)
+        for line in wrap(clean(s, md), size, bold, indent):
             ensure(lh)
-            S["fig"].text(LEFT + indent, S["y"], line, fontsize=size, color=color,
-                          fontweight="bold" if bold else "normal",
-                          style="italic" if italic else "normal")
+            text(LEFT + indent, S["y"], line, fontsize=size, color=color,
+                 fontweight="bold" if bold else "normal",
+                 style="italic" if italic else "normal", va="top")
             S["y"] -= lh
         S["y"] -= after
 
-    def heading(s, gap_before=0.018):
+    def heading(s, gap_before=0.020, keep_with=0.05):
         S["y"] -= gap_before
-        ensure(0.04)
-        S["fig"].text(LEFT, S["y"], s, fontsize=12.5, color=DARK, fontweight="bold")
-        S["y"] -= 0.009
+        ensure(0.032 + keep_with)               # never strand a heading at the foot
+        text(LEFT, S["y"], s, fontsize=12.5, color=DARK, fontweight="bold",
+             va="top")
+        S["y"] -= 0.024
         rule(S["y"], color=TEAL, lw=1.4)
-        S["y"] -= 0.017
+        S["y"] -= 0.012
 
-    def qa_section(title, items, intro=None, round_tag=False):
-        heading(title)
-        if intro:
-            para(intro, size=8.6, color=GREY, italic=True, after=0.009)
-        if not items:
-            para("None recorded.", size=9, color=LGREY)
-            return
-        for k, v in items:
-            q = v["q"]
-            if round_tag and k[:1] == "R" and k.split(" ")[0][1:].isdigit():
-                q = f"Round {k.split(' ')[0][1:]} — {q}"
-            para(q, size=9.2, color=DARK, bold=True, after=0.002)
-            para(v["a"], size=9.2, color="#2c2c2c", indent=0.022, after=0.010)
+    def table(cols, cells, col_w=None, rowh=0.024, size=8.5):
+        """A zebra table that splits across pages, repeating its header row."""
+        i = 0
+        while i < len(cells):
+            ensure(rowh * 3)
+            fit = max(1, int((S["y"] - BOT) / rowh) - 1)
+            chunk = cells[i:i + fit]
+            th = rowh * (len(chunk) + 1)
+            ax = S["fig"].add_axes([LEFT, S["y"] - th, RIGHT - LEFT, th])
+            ax.axis("off")
+            tbl = ax.table(cellText=chunk, colLabels=cols, cellLoc="center",
+                           colWidths=col_w, bbox=[0, 0, 1, 1])
+            tbl.auto_set_font_size(False)
+            tbl.set_fontsize(size)
+            for (r, c), cell in tbl.get_celld().items():
+                cell.set_edgecolor("#d9dede")
+                cell.get_text().set_parse_math(False)
+                if r == 0:
+                    cell.set_facecolor(TEAL)
+                    cell.set_text_props(color="white", weight="bold")
+                elif r % 2 == 0:
+                    cell.set_facecolor("#f4f8f7")
+            S["y"] -= th + 0.010
+            i += len(chunk)
 
-    # ---------------- PAGE 1: title band, meta, KPIs, tables ----------------
+    def money(v):
+        return f"-${abs(v):,.0f}" if v < 0 else f"${v:,.0f}"
+
+    # ---------------- PAGE 1: title band, student, scenario -----------------
     new_page()
     f = S["fig"]
-    f.add_artist(Rectangle((0, 0.917), 1.0, 0.083, transform=f.transFigure,
+    f.add_artist(Rectangle((0, 0.915), 1.0, 0.085, transform=f.transFigure,
                            facecolor=TEAL, edgecolor="none", zorder=0))
-    f.text(LEFT, 0.947, "Juicetification: The Lean Rush", fontsize=20,
-           color="white", fontweight="bold")
-    f.text(LEFT, 0.927, "Lean Operations Simulation — Student Report",
-           fontsize=10.5, color="#dff3ef")
-    # ---- status band: the first thing anyone reads on this report ----------
-    _miss_lines = [] if status["complete"] else _tw.wrap(
-        "Still outstanding: " + "; ".join(status["missing"]) + ".", 112)[:3]
-    _band_h = 0.030 if status["complete"] else 0.034 + 0.013 * len(_miss_lines)
-    _band_y = 0.917 - _band_h - 0.008
-    f.add_artist(Rectangle((LEFT, _band_y), RIGHT - LEFT, _band_h,
+    text(LEFT, 0.962, "Juicetification: The Lean Rush", fontsize=20,
+         color="white", fontweight="bold", va="top")
+    text(LEFT, 0.932, "Lean Operations Simulation — Student Report",
+         fontsize=10.5, color="#dff3ef", va="top")
+    # ---- status band: the first thing anyone reads on this report ----
+    miss = ([] if status["complete"] else
+            wrap(clean("Still outstanding: " + "; ".join(status["missing"]) + "."),
+                 8.2, indent=0.024)[:4])
+    band_h = 0.030 if status["complete"] else 0.036 + 0.0135 * len(miss)
+    band_y = 0.915 - band_h - 0.010
+    f.add_artist(Rectangle((LEFT, band_y), RIGHT - LEFT, band_h,
                            transform=f.transFigure,
                            facecolor="#eaf6f3" if status["complete"] else AMBER,
                            edgecolor=TEAL if status["complete"] else AMBER_DK,
                            lw=1.4, zorder=1))
     if status["complete"]:
-        f.text(LEFT + 0.012, _band_y + _band_h / 2,
-               "COMPLETE REPORT  —  simulation objectives met, debrief finished",
-               fontsize=11, color=TEAL, fontweight="bold", va="center", zorder=2)
+        text(LEFT + 0.012, band_y + band_h / 2,
+             "COMPLETE REPORT  —  simulation objectives met, debrief finished",
+             fontsize=11, color=TEAL, fontweight="bold", va="center", zorder=2)
     else:
-        f.text(LEFT + 0.012, _band_y + _band_h - 0.014,
-               "INCOMPLETE REPORT  —  submitted before the work was finished",
-               fontsize=11, color=AMBER_DK, fontweight="bold", va="center", zorder=2)
-        for _i, _line in enumerate(_miss_lines):
-            f.text(LEFT + 0.012, _band_y + _band_h - 0.030 - _i * 0.013, _line,
-                   fontsize=8.2, color=AMBER_DK, va="center", zorder=2)
-    S["y"] = _band_y - 0.022
+        text(LEFT + 0.012, band_y + band_h - 0.015,
+             "INCOMPLETE REPORT  —  submitted before the work was finished",
+             fontsize=11, color=AMBER_DK, fontweight="bold", va="center", zorder=2)
+        for i, line in enumerate(miss):
+            text(LEFT + 0.012, band_y + band_h - 0.032 - i * 0.0135, line,
+                 fontsize=8.2, color=AMBER_DK, va="center", zorder=2)
+    S["y"] = band_y - 0.016
+    para(f"Student:  {name}", size=10.5, color=DARK, bold=True, after=0.003,
+         md=False)
+    para(f"Scenario #{SC['sid']}   ·   Demand: {SC['demand']}   ·   {today}",
+         size=9.2, color=GREY, after=0.010)
+    para(SC["briefing"], size=8.8, color=GREY, after=0.012)
 
-    para(f"Student:  {name}", size=10.5, color=DARK, bold=True, after=0.002)
-    para(f"Scenario #{SC['sid']}    ·    Demand: {SC['demand']}    ·    {today}",
-         size=9.5, color=GREY, after=0.011)
-    para(SC["briefing"].replace("**", ""), size=8.8, color=GREY, after=0.006)
-
-    # KPI cards
-    ensure(0.09)
-    kpis = [("Rounds", f"{len(ctx['hist'])}"), ("Best Lean", f"{ctx['best']:.0f}"),
-            ("Final Lean", f"{ctx['final']:.0f}"), ("Lean gain", f"{ctx['gain']:+.0f}"),
-            ("Profit vs messy", f"${ctx['improvement']:+.0f}")]
+    # ---- KPI cards (each figure appears once in the report) ----
+    _, quiz_n, quiz_ok, _ = debrief_status()
+    dentry = _debrief_entry()
+    kpis = [("Rounds played", f"{len(hist)}"),
+            ("Lean Score", f"{ctx['first']:.0f} → {ctx['final']:.0f}"),
+            ("Profit vs messy shop", money(ctx["improvement"]).replace("$", "+$", 1)
+             if ctx["improvement"] >= 0 else money(ctx["improvement"])),
+            ("Objectives", "Met" if dentry else "Not yet"),
+            ("Knowledge check", f"{quiz_ok}/{len(DEBRIEF_QUIZ)}")]
     gap = 0.012
-    cardw = (RIGHT - LEFT - 4 * gap) / 5.0
-    cy = S["y"] - 0.062
+    cardw = (RIGHT - LEFT - (len(kpis) - 1) * gap) / len(kpis)
+    ensure(0.075)
+    cy = S["y"] - 0.060
     for i, (k, v) in enumerate(kpis):
         cx = LEFT + i * (cardw + gap)
         f.add_artist(FancyBboxPatch((cx, cy), cardw, 0.058,
                      boxstyle="round,pad=0.003,rounding_size=0.010",
                      transform=f.transFigure, facecolor="#f2f8f7",
                      edgecolor=TEAL, lw=1.0, mutation_aspect=0.5))
-        f.text(cx + cardw / 2, cy + 0.037, v, fontsize=15, color=DARK,
-               fontweight="bold", ha="center", va="center")
-        f.text(cx + cardw / 2, cy + 0.014, k, fontsize=7.6, color=GREY,
-               ha="center", va="center")
-    S["y"] = cy - 0.018
+        text(cx + cardw / 2, cy + 0.036, v, fontsize=14 if len(v) < 8 else 11.5,
+             color=DARK, fontweight="bold", ha="center", va="center")
+        text(cx + cardw / 2, cy + 0.012, k, fontsize=7.4, color=GREY,
+             ha="center", va="center")
+    S["y"] = cy - 0.008
 
-    heading("Round-by-round performance")
-    if ctx["hist"]:
-        cols = ["Rd", "Lean", "Cycle", "Served", "Wrong", "Waste", "Lost%",
-                "Upkeep", "Profit"]
-        cells = [[h["round"], f"{h['lean_score']:.0f}", f"{h['avg_cycle']:.0f}s",
-                  f"{h['served']:.0f}", f"{h['defects']:.0f}", f"{h['waste']:.0f}",
-                  f"{h['abandon_pct']:.0f}%", f"${h['upkeep']:.0f}",
-                  f"${h['profit']:.0f}"] for h in ctx["hist"]]
-        rowh = 0.025
-        th = rowh * (len(cells) + 1)
-        ensure(th + 0.02)
-        axb = S["y"] - th
-        ax = f.add_axes([LEFT, axb, RIGHT - LEFT, th])
-        ax.axis("off")
-        tbl = ax.table(cellText=cells, colLabels=cols, loc="center",
-                       cellLoc="center")
-        tbl.auto_set_font_size(False)
-        tbl.set_fontsize(8.5)
-        tbl.scale(1, 1.25)
-        for (r, c), cell in tbl.get_celld().items():
-            cell.set_edgecolor("#d9dede")
-            if r == 0:
-                cell.set_facecolor(TEAL)
-                cell.set_text_props(color="white", weight="bold")
-            elif r % 2 == 0:
-                cell.set_facecolor("#f4f8f7")
-        S["y"] = axb - 0.006
+    # ---- objectives (for the round that completed the core simulation) ----
+    if hist:
+        h_obj = dentry or hist[-1]
+        c_obj, r_obj = _entry_cfg_res(h_obj)
+        if r_obj is not None:
+            o = objectives_status(c_obj, r_obj)
+            heading(f"Objectives — Round {h_obj['round']}"
+                    + (" (core simulation completed)" if dentry else " (latest)"))
+            for ok, label in ((o["wastes_ok"], f"Every waste worth addressing "
+                               f"is addressed — {o['done']}/{o['total']}"),
+                              (o["score_ok"], f"Lean Score at least {LEAN_TARGET} — "
+                               f"{r_obj.lean_score:.0f}"),
+                              (o["profit_ok"], f"Running a profit — "
+                               f"{money(r_obj.profit)}"),
+                              (o["spend_ok"], "Every dollar spent earns its keep — "
+                               f"{len(o['waste_rows'])} purchase(s) not paying "
+                               "for themselves")):
+                para(("✓  " if ok else "✗  ") + label, size=9.2,
+                     color=GOOD if ok else BAD, bold=True, after=0.002)
 
-    heading("Decisions made each round")
-    for h in ctx["hist"]:
-        para(f"Round {h['round']}:  {h.get('decisions', '—') or '—'}",
-             size=8.8, color="#2c2c2c", after=0.003)
+    # ---- round-by-round results table ----
+    heading("Round-by-round results")
+    if hist:
+        table(["Round", "Lean", "Cycle", "Served", "Wrong", "Waste", "Lost",
+               "Upkeep", "Profit"],
+              [[h["round"], f"{h['lean_score']:.0f}", f"{h['avg_cycle']:.0f}s",
+                f"{h['served']:.0f}", f"{h['defects']:.0f}", f"{h['waste']:.0f}",
+                f"{h['abandon_pct']:.0f}%", money(h["upkeep"]), money(h["profit"])]
+               for h in hist])
+        if len(hist) >= 2:                       # trend chart, kept on one page
+            ch = 0.17
+            ensure(ch + 0.02)
+            # axes sit inside the reserved band with room for titles and ticks
+            axL = S["fig"].add_axes([LEFT + 0.05, S["y"] - ch + 0.025, 0.33, ch - 0.05])
+            axP = S["fig"].add_axes([LEFT + 0.48, S["y"] - ch + 0.025, 0.33, ch - 0.05])
+            xs = [h["round"] for h in hist]
+            for ax, ys, ttl, col in ((axL, [h["lean_score"] for h in hist],
+                                      "Lean Score by round", TEAL),
+                                     (axP, [h["profit"] for h in hist],
+                                      "Profit ($) by round", "#e76f51")):
+                ax.plot(xs, ys, marker="o", color=col, lw=2)
+                ax.set_title(ttl, fontsize=8.5, color=DARK)
+                ax.tick_params(labelsize=7)
+                ax.xaxis.set_major_locator(MaxNLocator(nbins=10, integer=True))
+                ax.grid(alpha=0.3)
+                for sp in ("top", "right"):
+                    ax.spines[sp].set_visible(False)
+            S["y"] -= ch + 0.004
+    else:
+        para("No rounds played yet.", size=9, color=LGREY)
 
-    # ---------------- flowing reflection / knowledge sections ----------------
-    coach = [(k, v) for k, v in refl.items() if k.endswith("coach")]
-    preds = [(k, v) for k, v in refl.items() if "plan prediction" in k]
-    debrief = [(k, v) for k, v in refl.items() if k.startswith("Debrief")]
-    quiz = [(k, v) for k, v in refl.items() if k.startswith("Knowledge check")]
+    # ---- round journal: decisions → prediction → coach, once per round ----
+    heading("Round journal — decisions, predictions and coach diagnoses",
+            keep_with=0.16)
+    para("Each round lists the shop you ran, the prediction you committed before "
+         "running it, and how you diagnosed the result with the coach.",
+         size=8.6, color=GREY, italic=True, after=0.008)
+    for j in _report_journal():
+        lines = [(f"Round {j['round']}", 10, DARK, True, 0.0)]
+        lines.append((f"Decisions run: {j['decisions']}", 8.8, INK, False, 0.022))
+        if j["pred"]:
+            verdict = {True: "came true", False: "missed",
+                       None: "experiment"}[j["right"]]
+            lines.append((f"Prediction: {j['pred']} — {verdict}"
+                           + (f" ({j['fact']})" if j["fact"] else ""),
+                           8.8, INK, False, 0.022))
+        if j["coach"]:
+            c = j["coach"]
+            lines.append((f"Coach: {c['q']}", 8.8, DARK, True, 0.022))
+            lines.append((f"Your diagnosis: {c['a']}"
+                          + ("  (best answer)" if c["ok"]
+                             else f"  (best answer: {c['best']})")
+                          + ("  — asked for help" if c["helped"] else ""),
+                          8.8, GOOD if c["ok"] else INK, False, 0.044))
+        need = sum(para_height(clean(s), sz, b, ind, 0.002)
+                   for s, sz, _, b, ind in lines) + 0.010
+        ensure(min(need, TOP - BOT))             # keep a round's block together
+        for s, sz, col, b, ind in lines:
+            para(s, size=sz, color=col, bold=b, indent=ind, after=0.002)
+        S["y"] -= 0.008
 
-    qa_section("Coaching Kata — your obstacle diagnoses", coach,
-               "Each round you named the biggest obstacle before deciding.",
-               round_tag=True)
-    qa_section("Round predictions (PLAN · commit)", preds, round_tag=True)
-    qa_section("Debrief reflections", debrief,
-               "Your written synthesis across the whole game.")
-    qa_section("Knowledge check", quiz,
-               "End-of-game multiple-choice check of the core lean concepts.")
+    # ---- debrief reflections ----
+    heading("Debrief reflections")
+    for qid, prompt, _ in DEBRIEF_QS:
+        a = str(_ans(f"debrief_{qid}", "")).strip()
+        para(prompt, size=9.2, color=DARK, bold=True, after=0.002)
+        para(a or "(not answered)", size=9.2, color=INK if a else LGREY,
+             indent=0.022, after=0.010, md=False)
+
+    # ---- knowledge check ----
+    heading(f"Knowledge check — {quiz_ok}/{len(DEBRIEF_QUIZ)} correct")
+    for qi, qz in enumerate(DEBRIEF_QUIZ):
+        a = _ans(f"dquiz_{qi}")
+        para(f"{qi + 1}. {qz['q']}", size=9.2, color=DARK, bold=True, after=0.002)
+        if a is None:
+            para("(not answered)", size=9.2, color=LGREY, indent=0.022, after=0.010)
+        elif a == qz["answer"]:
+            para(f"✓  {a}", size=9.2, color=GOOD, indent=0.022, after=0.010)
+        else:
+            para(f"✗  {a}", size=9.2, color=BAD, indent=0.022, after=0.001)
+            para(f"Correct answer: {qz['answer']}", size=8.6, color=GREY,
+                 italic=True, indent=0.022, after=0.010)
 
     _finish_page()
     pdf.close()
@@ -2942,36 +3310,40 @@ with st.sidebar:
     # If the last rush could not be restored there is no question to answer, so
     # gating would be a dead end — let the student run the next round instead.
     _coach_on_screen = st.session_state.get("last_result") is not None
-    need_coach = (bool(_lr) and _coach_on_screen
-                  and st.session_state.get(_ck) is None)
+    need_coach = (bool(_lr) and _coach_on_screen and _ans(_ck) is None)
     # you must also COMMIT a plan (predict) before you can run the next rush —
     # again, only while that commit widget is actually on screen (it lives in the
     # PLAN panel, which is only drawn when the last rush is available).
     _pck = f"plancommit_{st.session_state.round}"
-    need_plan = (bool(_lr) and _coach_on_screen
-                 and st.session_state.get(_pck) is None)
+    need_plan = (bool(_lr) and _coach_on_screen and _ans(_pck) is None)
     need_run = need_coach or need_plan
-    if not need_run:
-        st.markdown(
-            "<style>@keyframes jrpulse{0%{box-shadow:0 0 0 0 rgba(42,157,143,.7);}"
-            "70%{box-shadow:0 0 0 16px rgba(42,157,143,0);}"
-            "100%{box-shadow:0 0 0 0 rgba(42,157,143,0);}}"
-            'section[data-testid="stSidebar"] button[kind="primary"]'
-            "{animation:jrpulse 1.1s infinite;border-radius:8px;}</style>",
-            unsafe_allow_html=True)
-    run = st.button(f"▶️  DO — run the rush  (Round {st.session_state.round})",
-                    type="primary", use_container_width=True, disabled=need_run)
-    if need_coach:
-        st.caption("🔒 Step 1: **answer the coach** at the top (Act on your result).")
-        jr_jump_button("⬆️ Go to the coach's question", height=56)
-    elif RESULT_MISSING:
-        st.caption("↩︎ Your last rush couldn't be restored (the page was refreshed "
-                   "or reconnected). Your rounds and answers are safe — press "
-                   "**DO** to run the next round and the coach comes back.")
-    elif need_plan:
-        st.caption("🔒 Step 2: **make & commit your plan** on the right, then run.")
-    else:
-        st.caption("✅ Plan committed — press **DO** to run the rush.")
+    run = False
+    _on_sim = st.session_state.page == "sim"
+    if not _on_sim:
+        st.button("◀  Back to the simulation", type="primary",
+                  use_container_width=True, on_click=_go, args=("sim",))
+    if _on_sim:
+        if not need_run:
+            st.markdown(
+                "<style>@keyframes jrpulse{0%{box-shadow:0 0 0 0 rgba(42,157,143,.7);}"
+                "70%{box-shadow:0 0 0 16px rgba(42,157,143,0);}"
+                "100%{box-shadow:0 0 0 0 rgba(42,157,143,0);}}"
+                'section[data-testid="stSidebar"] button[kind="primary"]'
+                "{animation:jrpulse 1.1s infinite;border-radius:8px;}</style>",
+                unsafe_allow_html=True)
+        run = st.button(f"▶️  DO — run the rush  (Round {st.session_state.round})",
+                        type="primary", use_container_width=True, disabled=need_run)
+        if need_coach:
+            st.caption("🔒 Step 1: **answer the coach** at the top (Act on your result).")
+            jr_jump_button("⬆️ Go to the coach's question", height=56)
+        elif RESULT_MISSING:
+            st.caption("↩︎ Your last rush couldn't be restored (the page was refreshed "
+                       "or reconnected). Your rounds and answers are safe — press "
+                       "**DO** to run the next round and the coach comes back.")
+        elif need_plan:
+            st.caption("🔒 Step 2: **make & commit your plan** on the right, then run.")
+        else:
+            st.caption("✅ Plan committed — press **DO** to run the rush.")
 
     # ---- Report & progress: ALWAYS here, whatever else the page is doing ----
     # This used to live only in an expander at the very bottom of the page, where
@@ -2984,8 +3356,8 @@ with st.sidebar:
         st.markdown(
             f"{'✅' if _rs['rounds'] else '⬜'} Rounds played — **{_rs['rounds']}**  \n"
             f"{'✅' if _rs['objectives_ok'] else '⬜'} All four objectives met  \n"
-            f"{'✅' if _rs['reflections'] >= 4 else '⬜'} Written reflections — "
-            f"**{_rs['reflections']}/4**  \n"
+            f"{'✅' if _rs['reflections'] >= len(DEBRIEF_QS) else '⬜'} Written "
+            f"reflections — **{_rs['reflections']}/{len(DEBRIEF_QS)}**  \n"
             f"{'✅' if _rs['quiz'] >= _rs['quiz_total'] else '⬜'} Knowledge check — "
             f"**{_rs['quiz']}/{_rs['quiz_total']}**  \n"
             f"{'✅' if (st.session_state.get('student') or '').strip() else '⬜'} "
@@ -3015,9 +3387,10 @@ with st.sidebar:
                 st.caption("Generated just now. Click **Generate report** again "
                            "after you answer more, to refresh it.")
 
-    # PDCA tracker — highlights the phase for the section you're scrolled to
-    import streamlit.components.v1 as _components
-    _components.html("""
+    if _on_sim:
+        # PDCA tracker — highlights the phase for the section you're scrolled to
+        import streamlit.components.v1 as _components
+        _components.html("""
 <div style="font-family:sans-serif;text-align:center">
   <div style="font-weight:700;color:#264653;margin-bottom:6px">PDCA · kaizen ↻</div>
   <div id="p-CHECK" class="pchip">🔍 CHECK</div>
@@ -3049,7 +3422,7 @@ function jrPhase(){
 P.addEventListener('scroll',function(){P.requestAnimationFrame(jrPhase);},true);
 setInterval(jrPhase,300);jrPhase();
 </script>
-""", height=260)
+    """, height=260)
     st.divider()
 
     st.session_state.game_mode = st.radio(
@@ -3103,7 +3476,8 @@ setInterval(jrPhase,300);jrPhase();
         st.session_state.baseline = {}
         st.session_state.tested = []
         st.session_state.staged = []
-        st.session_state.reflections = {}
+        st.session_state.answers = {}
+        st.session_state.page = "sim"
         st.session_state.coach_q = {}
         st.session_state.asked_coach = set()
         st.session_state.order_nonce += 1
@@ -3133,39 +3507,6 @@ if sid:
                + (" · progress saved automatically" if store.enabled()
                   else " · (progress storage not detected)"))
 
-# One-time orientation, shown only while planning the very first round. It sets
-# expectations up front (time, save behaviour, the required/reviewed debrief) so
-# students who skip the printed handout still know the ground rules.
-if st.session_state.round == 1 and not st.session_state.history:
-    _saves = (sid and store.enabled())
-    with st.expander("ℹ️  Before you begin — please read", expanded=True):
-        st.markdown(
-            "- ⏱️ **Plan about 30–45 minutes.** It's best done in one sitting.\n"
-            + ("- 💾 **Your progress saves automatically** — you can close the tab and "
-               "return to the same link later to pick up where you left off.\n"
-               if _saves else
-               "- 💾 **Finish in one sitting.** Your work is kept only for this browser "
-               "session, so don't leave the tab idle for long or refresh — you may "
-               "lose your progress.\n")
-            + "- 🎓 **There is a required debrief.** The game ends with short written "
-              "reflections and a knowledge check that are **required and reviewed by "
-              "your instructor**. You can download your report at any time, but it is "
-              "stamped **INCOMPLETE** until they are done. Play to *learn the ideas*, "
-              "not just to hit the numbers.\n"
-            + "- ▶️ **How each round works:** run the rush → read what went wrong → "
-              "answer the coach → change one decision → run again, until you've "
-              "addressed all seven wastes with a solid Lean Score and a profit.")
-
-st.markdown(f"🏪 {SC['briefing']}")
-st.subheader(plan["title"])
-st.info(f"🎯 **Your goal:** {plan['focus']}")
-st.caption(f"💡 **Why this matters:** {plan['why']}  ·  Lean idea: {plan['concept']}")
-st.caption("🔁 This page is one turn of the **PDCA / kaizen** cycle, read as a "
-           "loop: **CHECK** your last rush's result & wastes (top) → **ACT** on it "
-           "with the coach to choose your next move → **PLAN** that change in your "
-           "decisions → **DO** it with the RUN button. *Act flows straight into the "
-           "next Plan — that is kaizen.*")
-
 # ---- which of the 7 waste-decisions are unlocked this round (needed early) ----
 WASTE_KEYS = ["overproduction", "transport", "motion", "overprocessing",
               "inventory", "defects", "waiting"]
@@ -3185,935 +3526,357 @@ else:
 # below) and keep the rest collapsed. Free play opens everything.
 _focus = set()
 
-# ======================================================================
-# CHECK + ACT (top) — after a rush, show the result, then the Coaching Kata
-# (Act), so pressing DO and jumping to the top lands on them in PDCA order.
-# ======================================================================
-_res = st.session_state.last_result
-_cfgd = st.session_state.last_cfg
-if _res is None and RESULT_MISSING:
-    # A rush was run but its result is gone (refresh / reconnect / restored save
-    # from an older version). Say so plainly and give a way forward — this is the
-    # state that used to look like "the coach's question disappeared".
+# ==========================================================================
+# PAGES — Simulation · Past rounds · Debrief · Report
+# Navigation is a row of buttons at the top of the main area. The current page
+# is plain session state (not a widget), so it is saved with progress and a
+# returning student lands where they left off.
+# ==========================================================================
+def render_nav():
+    ss = st.session_state
+    unlocked = _debrief_entry() is not None
+    ready = unlocked and debrief_status()[3]
+    complete = report_status()["complete"]
+    labels = {
+        "sim": f"🏪 Simulation · Round {ss.round}",
+        "rounds": f"🕘 Past rounds ({len(ss.history)})",
+        "debrief": "🎓 Debrief" + (" ✅" if ready else ("" if unlocked else " 🔒")),
+        "report": "📄 Report" + (" ✅" if complete else ""),
+    }
+    cols = st.columns(len(labels))
+    for col, (key, label) in zip(cols, labels.items()):
+        col.button(label, key=f"nav_{key}", use_container_width=True,
+                   type="primary" if ss.page == key else "secondary",
+                   on_click=_go, args=(key,))
+
+
+def render_page_footer():
+    """Bottom-of-page shortcuts on the Simulation page."""
+    st.divider()
+    f1, f2 = st.columns(2)
+    if st.session_state.history:
+        f1.button("🕘  Review or rewind a past round", use_container_width=True,
+                  key="foot_rounds", on_click=_go, args=("rounds",))
+    if _debrief_entry() is not None:
+        f2.button("🎓  Go to the debrief  →", type="primary",
+                  use_container_width=True, key="foot_debrief",
+                  on_click=_go, args=("debrief",))
+
+
+def _decision_table(cd):
+    """The full set of decisions saved for a round, as a readable table."""
+    order = cd["order"]
+    staff = (f"{cd['employees']} (whole-order)" if cd["mode"] == "Whole-order"
+             else f"{cd['employees']} (prep {cd['spec_prep']} · blend "
+                  f"{cd['spec_blend']} · finish {cd['spec_finish']})")
+    rows = [
+        ("Overproduction · Sort", f"batch {cd['batch']}, {cd['premade']} pre-made"),
+        ("Transport · Set in order",
+         " → ".join(STATION_ABBR[s] for s in order)
+         + f"  ({order_distance(order)} steps, {backtracks(order)} backtrack(s))"),
+        ("Motion · Shine", cd["five_s"]),
+        ("Overprocessing · Standardize",
+         sim.STANDARD_LEVELS[cd["standard_level"]]["name"]),
+        ("Inventory · Sustain",
+         ", ".join(t for t, on in (("FIFO rotation", cd["fifo"]),
+                                   ("pull replenishment", cd["pull"])) if on)
+         or "none"),
+        ("Defects · visual signals", sim.VISUAL_LEVELS[cd["visual_level"]]["name"]),
+        ("Waiting · capacity", f"{staff} baristas, {cd['blenders']} blender(s)"),
+        ("Extra purchases", ", ".join(nm for f, nm in EXTRA_BUYS if cd.get(f))
+         or "none"),
+    ]
+    return pd.DataFrame(rows, columns=["Decision", "What was set"])
+
+
+def render_rounds_page():
+    ss = st.session_state
+    hist = ss.history
+    st.header("🕘 Past rounds")
+    if not hist:
+        st.info("No rounds yet — run Round 1 on the **Simulation** page first.")
+        return
+    st.caption("Look back at any rush you've run: its results, the decisions "
+               "behind it, your prediction and your coach answer. Viewing changes "
+               "nothing — only the ⏪ / 📋 buttons do.")
+    st.dataframe(pd.DataFrame([{
+        "Round": h["round"], "Lean": round(h["lean_score"]),
+        "Profit $": round(h["profit"]), "Served": round(h["served"]),
+        "Wrong": round(h["defects"]), "Waste": round(h["waste"]),
+        "Lost %": round(h["abandon_pct"]),
+        "Objectives": "✅" if h.get("all_ok") else "—",
+        "Decisions": h.get("decisions", ""),
+    } for h in hist]), hide_index=True, use_container_width=True)
+
+    rounds = [h["round"] for h in hist]
+    if ss.get("rounds_pick") not in rounds:
+        ss.pop("rounds_pick", None)
+    pick = st.selectbox(
+        "Open a round", rounds, index=len(rounds) - 1, key="rounds_pick",
+        format_func=lambda r: f"Round {r}" + ("  (latest)" if r == rounds[-1] else ""))
+    idx = rounds.index(pick)
+    h = hist[idx]
+    c, r = _entry_cfg_res(h)
+
     with st.container(border=True):
-        st.warning("↩︎ **Your last rush couldn't be restored.** The page was "
-                   "refreshed or reconnected, so the CHECK panel and the coach's "
-                   "question for that round aren't available.")
-        st.markdown("**Nothing is lost:** your rounds, decisions and every answer "
-                    "you've given are still recorded and still go on your report. "
-                    "Your decisions below are exactly where you left them.")
-        st.markdown("▶️ Press **DO — run the rush** in the sidebar to run the next "
-                    "round; the result panel and a fresh coach's question come "
-                    "back with it.")
-        st.caption("You can also generate your report from **Report & progress** "
-                   "in the sidebar at any time.")
-if _res is not None:
-    res = _res
-    cfg_done = _cfgd
-    diag = _diag = sim.seven_wastes_diagnostic(cfg_done, res)
-    hist = st.session_state.history
-    prev = hist[-2] if len(hist) > 1 else None
+        st.markdown(f"### Round {pick}")
+        m = st.columns(5)
+        m[0].metric("Lean Score", f"{h['lean_score']:.0f}")
+        m[1].metric("Profit", f"${h['profit']:.0f}")
+        m[2].metric("Avg cycle", f"{h['avg_cycle']:.0f}s")
+        m[3].metric("Served / arrived", f"{h['served']:.0f}/{h['arrivals']:.0f}")
+        m[4].metric("Wrong orders", f"{h['defects']:.0f}")
 
-    def d(cur, key):
-        if not prev:
-            return None
-        v = cur - prev[key]
-        return f"{v:+.0f}" if abs(v) >= 1 else f"{v:+.1f}"
+        pred, right, fact = prediction_verdict(idx)
+        if pred:
+            tag = {True: "✅ came true", False: "❌ missed",
+                   None: "🧪 experiment"}[right]
+            st.markdown(f"**Your prediction:** *{pred}* — {tag}"
+                        + (f" ({fact.replace('$', chr(92) + '$')})" if fact else ""))
+        cq = ss.coach_q.get(pick)
+        ch = _ans(f"coachmc_{pick}")
+        if cq:
+            st.markdown(f"**Coach question after this rush:** {cq['q']}")
+            if ch:
+                ok = cq["options"].index(ch) == cq["best"] if ch in cq["options"] else False
+                st.markdown(f"**Your diagnosis:** {ch} "
+                            + ("— ✅ good read" if ok else "— 🤔 not the leanest read")
+                            + (" · asked for help" if _ans(f"helped_{pick}") else ""))
+            else:
+                st.markdown("**Your diagnosis:** *not answered yet*")
 
-    # ---------- CHECK (all together) ----------
-    st.markdown("<div id='jr-check'></div>", unsafe_allow_html=True)
-    st.markdown(f"## 🔍 CHECK — your last rush "
-                f"(🏆 Lean **{res.lean_score:.0f}/100** · 💵 **\\${res.profit:.0f}**)")
-    st.progress(min(1.0, res.lean_score / 100))
-    m = st.columns(4)
-    m[0].metric("Avg cycle time", f"{res.avg_cycle:.0f}s",
-                d(res.avg_cycle, "avg_cycle"), delta_color="inverse")
-    m[1].metric("Served / arrived", f"{res.served:.0f}/{res.arrivals:.0f}",
-                d(res.served, "served"))
-    m[2].metric("Wrong orders", f"{res.defects:.0f}",
-                d(res.defects, "defects"), delta_color="inverse")
-    m[3].metric("Profit", f"${res.profit:.0f}", d(res.profit, "profit"))
-    st.caption(f"📊 **Predictability:** cycle time varied **± {res.avg_cycle_sd:.0f}s** "
-               "across the simulated rushes — standard work shrinks this spread "
-               "(see the *Variability* tab).")
-
-    # ---------- was your PLAN·commit prediction correct? ----------
-    _lastr0 = hist[-1]["round"]
-    _pred = st.session_state.get(f"plancommit_{_lastr0}")
-    if _pred and prev is not None:
-        _dS = res.lean_score - prev["lean_score"]
-        _dP = res.profit - prev["profit"]
-        _fact = (f"Lean **{_dS:+.0f}**, profit **{_dP:+.0f}\\$**")
-        if "BOTH" in _pred:
-            _right = _dS > 0 and _dP > 0
-        elif "even if profit dips" in _pred:
-            _right = _dS > 0
-        elif "re-running" in _pred:
-            _right = abs(_dS) <= 2 and abs(_dP) <= 5
-        else:                                   # "it might backfire" — always a win
-            _right = None
-        if _right is True:
-            st.success(f"🎯 **Your prediction was right!** You predicted *“{_pred}”* "
-                       f"— and it happened: {_fact}.")
-        elif _right is False:
-            st.error(f"🔄 **Your prediction missed.** You predicted *“{_pred}”*, but "
-                     f"the rush gave {_fact}. That gap is the most useful thing to "
-                     "learn from — why did it differ?")
+        if h.get("cdict"):
+            st.markdown("**Decisions run this round**")
+            st.dataframe(_decision_table(h["cdict"]), hide_index=True,
+                         use_container_width=True)
         else:
-            st.info(f"🧪 **You ran an experiment** (*“{_pred}”*) — result: {_fact}. "
-                    "Every experiment teaches you something, win or lose.")
+            st.caption(f"Decisions: {h.get('decisions', '—')}  *(saved by an "
+                       "earlier version — full detail isn't available)*")
 
-    # ---------- progress toward the debrief: the FOUR objectives ----------
-    _obj = objectives_status(cfg_done, res)
-    _done, _total, _items = _obj["done"], _obj["total"], _obj["items"]
-    _obj_met = sum([_obj["wastes_ok"], _obj["score_ok"], _obj["profit_ok"],
-                    _obj["spend_ok"]])
-    _wrows = _obj["waste_rows"]
+        if r is not None:
+            with st.expander("📊 Charts for this round", expanded=False):
+                diag = sim.seven_wastes_diagnostic(c, r)
+                g1, g2 = st.columns([1.05, 1])
+                with g1:
+                    show_seven_wastes(diag)
+                with g2:
+                    show_five_s(c)
+                order = cfg_layout_order(c)
+                g3, g4 = st.columns(2)
+                with g3:
+                    show_flow(order)
+                with g4:
+                    show_inventory_map(order, r, c)
+
+    # ---- going back ----
+    if h.get("cdict"):
+        st.markdown("#### ⏪ Go back to this round")
+        a1, a2 = st.columns(2)
+        with a1:
+            st.caption("**Copy** this round's decisions into your current plan. "
+                       "Nothing is deleted — you just start your next plan from here.")
+            st.button(f"📋  Use Round {pick}'s decisions as my plan",
+                      key=f"loadplan_{pick}", use_container_width=True,
+                      on_click=_load_plan_from, args=(pick,))
+        with a2:
+            later = [x for x in rounds if x > pick]
+            if later:
+                st.caption(f"**Rewind** the game to just after Round {pick}: Rounds "
+                           f"{later[0]}–{later[-1]} and their answers are removed and "
+                           f"you replay from Round {pick + 1}.")
+                if any(x.get("all_ok") for x in hist[idx + 1:]) and not any(
+                        x.get("all_ok") for x in hist[:idx + 1]):
+                    st.warning("Rewinding here re-locks the debrief until you meet "
+                               "the objectives again.")
+                ok = st.checkbox(f"Yes, remove Rounds {later[0]}–{later[-1]}",
+                                 key=f"rw_ok_{pick}")
+                st.button(f"⏪  Rewind to Round {pick}", key=f"rewind_{pick}",
+                          disabled=not ok, use_container_width=True,
+                          on_click=_rewind_to, args=(pick,))
+            else:
+                st.caption("This is your latest round — there's nothing after it "
+                           "to rewind.")
+
+
+def render_debrief_page():
+    ss = st.session_state
+    hist = ss.history
+    dentry = _debrief_entry()
+    st.header("🎓 Debrief — make sense of the whole game")
+    if dentry is None:
+        st.info("🔒 The debrief unlocks when one rush meets **all four "
+                "objectives**: every waste worth addressing addressed, Lean Score ≥ "
+                f"{LEAN_TARGET}, a profit, and no spending that fails to pay for "
+                "itself. Your latest rush's checklist is in **CHECK** on the "
+                "Simulation page.")
+        st.button("◀  Back to the simulation", type="primary", key="db_back_locked",
+                  on_click=_go, args=("sim",))
+        return
+
+    cfg_done, res = _entry_cfg_res(dentry)
+    diag = sim.seven_wastes_diagnostic(cfg_done, res)
+    st.caption("Research on simulations is blunt: most of the learning happens "
+               "*here*, in the reflection — not in the playing. Answer in your own "
+               f"words; your answers go on your report. (Based on **Round "
+               f"{dentry['round']}**, the rush that met all the objectives.)")
+
+    # ---- computed synthesis to anchor the reflection ----
+    hh = pd.DataFrame(hist)
+    jumps = hh["lean_score"].diff()
+    big_round = None
+    if len(jumps) > 1 and jumps[1:].notna().any():
+        bi = jumps[1:].idxmax()
+        big_round, big_delta = int(hh.loc[bi, "round"]), jumps[bi]
+        big_dec = hh.loc[bi, "decisions"]
+    first_s, last_s = hh["lean_score"].iloc[0], hh["lean_score"].iloc[-1]
+    first_p, last_p = hh["profit"].iloc[0], hh["profit"].iloc[-1]
+    cS = st.columns(3)
+    cS[0].metric("Lean Score", f"{last_s:.0f}", f"{last_s - first_s:+.0f} vs start")
+    cS[1].metric("Profit", f"${last_p:.0f}", f"${last_p - first_p:+.0f} vs start")
+    cS[2].metric("Rounds of kaizen", f"{len(hist)}")
+    if len(hist) >= 2:
+        k1, k2 = st.columns(2)
+        k1.markdown("Lean Score across rounds")
+        k1.line_chart(hh.set_index("round")[["lean_score"]])
+        k2.markdown("Profit across rounds")
+        k2.line_chart(hh.set_index("round")[["profit"]])
+    if big_round and big_delta > 0:
+        st.info(f"📈 Your biggest single-round jump was **+{big_delta:.0f} Lean "
+                f"points in Round {big_round}**, when you ran: *{big_dec}*.")
+
+    # ---- how each of the 7 wastes was tackled ----
+    st.markdown("### 📋 How you tackled each of the 7 wastes")
+    _dord = cfg_layout_order(cfg_done)
+    _decmap = {
+        "Transport": (f"line = {order_distance(_dord)} steps"
+                      + (", in order ✓" if backtracks(_dord) == 0
+                         else f", {backtracks(_dord)} backtrack(s)")),
+        "Overproduction": f"batch {cfg_done.batch_size}, pre-made {cfg_done.premade}",
+        "Motion": f"5S: {cfg_done.five_s}",
+        "Overprocessing": ("standard work: "
+                           f"{sim.STANDARD_LEVELS[cfg_done.standard_level]['name']}"),
+        "Inventory": ", ".join(
+            t for t, on in (("one-piece flow",
+                             cfg_done.batch_size == 1 and cfg_done.premade == 0),
+                            ("pull", cfg_done.pull_replenishment),
+                            ("FIFO", cfg_done.fifo_rotation)) if on) or "none yet",
+        "Defects": f"visual: {sim.VISUAL_LEVELS[cfg_done.visual_level]['name']}",
+        "Waiting": f"{cfg_done.employees} staff / {cfg_done.blenders} blenders",
+    }
+    _lean_map = {"Transport": "5S Set-in-order", "Overproduction": "5S Sort",
+                 "Motion": "5S Shine", "Overprocessing": "5S Standardize",
+                 "Inventory": "5S Sustain", "Defects": "Visual signals",
+                 "Waiting": "Capacity"}
+    st.dataframe(pd.DataFrame([{
+        "Waste": x["waste"], "Lean tool": _lean_map.get(x["waste"], ""),
+        "What you did": _decmap.get(x["waste"], ""), "Result": RAG[x["flag"]],
+    } for x in diag]), hide_index=True, use_container_width=True)
+    st.caption("🟢 solved · 🟡 improving · 🔴 still a problem. Five of the seven "
+               "wastes are fixed by the 5 S's; Defects and Waiting need quality "
+               "tools and capacity.")
+    _reds = sum(1 for x in diag if x["flag"] == "red")
+    _greens = sum(1 for x in diag if x["flag"] == "green")
     st.markdown(
-        f"**🎯 Objectives to complete the simulation ({_obj_met}/4 met)**  \n"
-        f"{'✅' if _obj['wastes_ok'] else '⬜'} Every waste worth addressing is "
-        f"addressed — **{_done}/{_total}**  \n"
-        f"{'✅' if _obj['score_ok'] else '⬜'} Lean Score ≥ {LEAN_TARGET} — "
-        f"**{res.lean_score:.0f}**  \n"
-        f"{'✅' if _obj['profit_ok'] else '⬜'} Running a profit (> \\$0) — "
-        f"**\\${res.profit:.0f}**  \n"
-        f"{'✅' if _obj['spend_ok'] else '⬜'} Every dollar you spend earns its "
-        f"keep — **{len(_wrows)}** purchase"
-        f"{' is' if len(_wrows) == 1 else 's are'} not paying for "
-        f"{'itself' if len(_wrows) == 1 else 'themselves'}")
-    st.progress(_obj_met / 4.0)
-    if _obj["all_ok"]:
-        st.caption("✅ All objectives met — the debrief is unlocked below.")
+        f"🧭 You inherited a shop scoring **{first_s:.0f}** with heavy waste. Over "
+        f"**{len(hist)} rounds of kaizen** you raised it to **{last_s:.0f}** and "
+        f"turned profit from **\\${first_p:.0f}** to **\\${last_p:.0f}**, with "
+        f"**{_greens}/7 wastes fully under control**"
+        + (f" ({_reds} still red)" if _reds else "")
+        + ". That is how real lean works — many small, evidence-based "
+        "improvements, repeated.")
+
+    # ---- written reflections (required) ----
+    st.divider()
+    st.markdown("### ✍️ Reflections *(required)*")
+    for qid, prompt, ph in DEBRIEF_QS:
+        k = f"debrief_{qid}"
+        st.text_area(prompt, key=_bind(k), height=80, placeholder=ph)
+        _keep(k)
+
+    # ---- knowledge check (required) ----
+    st.divider()
+    st.markdown("### 🧠 Knowledge check *(required)*")
+    st.caption("Answer all of these to show what you took away. Your answers "
+               "appear on the report.")
+    for qi, qz in enumerate(DEBRIEF_QUIZ):
+        k = f"dquiz_{qi}"
+        opts = _quiz_options(qi)
+        sel = st.radio(f"**{qi + 1}. {qz['q']}**", opts, index=None,
+                       key=_bind(k, opts))
+        _keep(k)
+        if sel is not None:
+            ok = sel == qz["answer"]
+            (st.success if ok else st.error)(
+                ("✓ Correct. " if ok else "✗ Not quite. ") + qz["explain"])
+
+    n_refl, n_quiz, n_ok, done = debrief_status()
+    if done:
+        st.success(f"✅ Debrief complete — knowledge check **{n_ok}/"
+                   f"{len(DEBRIEF_QUIZ)}**. Generate your report on the **📄 "
+                   "Report** page. 👏")
     else:
-        if not _obj["wastes_ok"]:
-            with st.expander("Which wastes are still left?", expanded=True):
-                st.caption("A waste ticks when its counter-measure is in place — "
-                           "**or** when nothing available for it would pay for "
-                           "itself here. Not spending is a real lean decision.")
-                for nm, ok, note in _items:
-                    st.markdown(f"{'✅' if ok else '⬜'} {nm}"
-                                + (f"  \n&nbsp;&nbsp;&nbsp;*{note}*" if note else ""))
-        if _wrows:
-            with st.expander("Which spending isn't earning its keep?",
-                             expanded=True):
-                st.caption("Each line re-runs your rush with **that one step "
-                           "undone** — everything else identical. A negative "
-                           "return means the shop makes MORE money without it. "
-                           "Drop it back a step, or spend the money where it "
-                           "does work.")
-                for r in sorted(_wrows, key=lambda x: x["d_profit"]):
-                    st.markdown(f"🔻 **{r['name']}** ({r['step']}) — costs "
-                                f"**\\${r['cost']:.0f}/rush**, returns "
-                                f"**{r['d_profit']:+.0f}\\$**")
+        st.warning(f"Answered **{n_refl}/{len(DEBRIEF_QS)}** reflections and "
+                   f"**{n_quiz}/{len(DEBRIEF_QUIZ)}** knowledge-check questions — "
+                   "finish them all for your report to count as COMPLETE (before "
+                   "then it is stamped INCOMPLETE). Your answers are saved as you "
+                   "go, so you can switch pages and come back.")
 
-    dc1, dc2 = st.columns([1.05, 1])
-    with dc1:
-        st.markdown("**The 7 wastes** (🟢 ok · 🟡 watch · 🔴 problem)")
-        show_seven_wastes(diag)
-    with dc2:
-        st.markdown("**Your 5S** (5 of these fix 5 of the wastes)")
-        show_five_s(cfg_done)
-    _show = [x for x in diag if (not dec_unlocked) or x["waste"].lower() in dec_unlocked]
-    if _show:
-        st.markdown("**What's happening in the wastes you can act on now:**")
-        for x in _show:
-            st.markdown(f"{RAG[x['flag']]} **{x['waste']}** — {x['detail']}  "
-                        f"*→ fix in the decision: {x['concept']}.*")
+    # ---- THE REVEAL: what was actually worth doing (held until now) ----
+    st.divider()
+    st.markdown("### 🪜 What was worth doing? — *revealed*")
+    st.caption("We held this back on purpose: the goal was for you to *discover* "
+               "it. Here's how much each of **your** improvements was really "
+               "adding to your final shop's profit — its value against its cost.")
+    with st.spinner("Analysing your decisions…"):
+        roi = debrief_roi(cfg_done, SC)
+    if roi:
+        show_impact_effort(roi)
+        roi_sorted = sorted(roi, key=lambda r: -r["d_profit"])
+        st.dataframe(pd.DataFrame([{
+            "Your decision": r["short"],
+            "Cost $/rush": f"{r['added_cost']:.0f}",
+            "Profit it added": f"${r['d_profit']:+.0f}",
+            "Lean pts added": f"{r['d_score']:+.0f}",
+        } for r in roi_sorted]), hide_index=True, use_container_width=True)
+        best = roi_sorted[0]
+        st.info(f"🏆 Your highest-return decision was **{best['short']}** (added "
+                f"\\${best['d_profit']:+.0f} for \\${best['added_cost']:.0f}/rush). "
+                "Notice the cheapest organizing changes usually gave the most **per "
+                "dollar** — that is the answer to *what to do first*.")
+    else:
+        st.caption("You didn't change much from the messy starting shop, so there's "
+                   "little to compare.")
+    st.markdown("**The general rule your game just demonstrated — the lean "
+                "priority ladder:**")
+    st.dataframe(LADDER, hide_index=True, use_container_width=True)
 
-    # PERFORMANCE: this used to be st.tabs(...), and Streamlit executes the body
-    # of EVERY tab on EVERY rerun — five views' worth of figures and charts each
-    # time a student clicked anything, whether or not they ever opened the panel.
-    # A radio renders only the view actually chosen, so a click costs one view.
-    with st.expander("📂 More detail — pick a view (5S, charts, costs, progress)"):
-        _VIEWS = ["🧹 5S detail", "👀 Problem visuals", "📊 Variability",
-                  "💵 Costs & ROI", "📈 Progress"]
-        _view = st.radio("Detail view", _VIEWS, horizontal=True,
-                         key="detail_view", label_visibility="collapsed")
-        if _view == _VIEWS[0]:
-            for name, done, decision, doing in five_s_status(cfg_done):
-                st.markdown(f"{'✅' if done else '⬜'} **{name}** — {doing}  \n"
-                            f"&nbsp;&nbsp;&nbsp;*decision: {decision}*")
-        elif _view == _VIEWS[2]:
-            st.markdown("**Managing variability — the spread, not just the average.**")
-            show_cycle_hist(res.all_cycle_times)
-            reps = res.reps
-            worst = max(reps, key=lambda r: r["abandoned"] / max(1, r["arrivals"]))
-            best = min(reps, key=lambda r: r["abandoned"] / max(1, r["arrivals"]))
-            wpct = 100 * worst["abandoned"] / max(1, worst["arrivals"])
-            bpct = 100 * best["abandoned"] / max(1, best["arrivals"])
-            cvv = st.columns(3)
-            cvv[0].metric("Average cycle time", f"{res.avg_cycle:.0f}s")
-            cvv[1].metric("Spread (±1 SD)", f"± {res.avg_cycle_sd:.0f}s")
-            cvv[2].metric("Worst 'bad day'", f"{wpct:.0f}% left",
-                          f"vs {bpct:.0f}% best day", delta_color="off")
-            st.info("Raising **standard work** makes each drink a more consistent "
-                    "time — the histogram narrows and the gap between good and bad "
-                    "days shrinks. Predictability is itself a lean win.")
-        elif _view == _VIEWS[1]:
-            order_done = cfg_layout_order(cfg_done)
-            st.caption("🕒 Shows the shop **as you ran it this round**; your pending "
-                       "edits apply next rush.")
-            st.markdown("**How your drink flowed**")
-            show_flow(order_done)
-            st.markdown("**Where inventory piled up** — 🔵 prep · 🟠 WIP · 🔴 made-"
-                        "ahead · dots = customers waiting.")
-            show_inventory_map(order_done, res, cfg_done)
-            v1, v2 = st.columns(2)
-            tl = res.timeline
-            with v1:
-                st.markdown("**Congestion through the rush**")
-                wdf = pd.DataFrame({"in shop": tl["wip"]},
-                                   index=[round(x, 1) for x in tl["min"]])
-                wdf.index.name = "minute"; st.line_chart(wdf)
-            with v2:
-                st.markdown("**Served vs arrived vs lost**")
-                fdf = pd.DataFrame({"arrived": tl["arrived"], "served": tl["served"],
-                                    "walked out": tl["walked_out"]},
-                                   index=[round(x, 1) for x in tl["min"]])
-                fdf.index.name = "minute"; st.line_chart(fdf)
-        elif _view == _VIEWS[3]:
-            base = baseline_ref(cfg_done.demand_level)
-            dprofit = res.profit - base.profit
-            st.caption(f"Lean upkeep costs **${res.upkeep:.0f}/rush**.")
-            cc = st.columns(3)
-            cc[0].metric("Profit now", f"${res.profit:.0f}")
-            cc[1].metric("Messy-shop profit", f"${base.profit:.0f}")
-            cc[2].metric("Your improvement", f"${dprofit:+.0f}")
-            cb = pd.DataFrame({"$": res.cost_breakdown}).sort_values("$", ascending=False)
-            st.bar_chart(cb, horizontal=True)
-            st.caption(f"Revenue \\${res.revenue:.0f} − Cost \\${res.total_cost:.0f} "
-                       f"= Profit \\${res.profit:.0f}")
-        elif _view == _VIEWS[4]:
-            if len(hist) >= 2:
-                h = pd.DataFrame(hist).set_index("round")
-                kk = st.columns(2)
-                kk[0].markdown("Lean Score ⬆"); kk[0].line_chart(h[["lean_score"]])
-                kk[1].markdown("Profit $ ⬆"); kk[1].line_chart(h[["profit"]])
-                tbl = h[["lean_score", "avg_cycle", "served", "defects", "waste",
-                         "abandon_pct", "upkeep", "profit"]].round(1)
-                tbl.columns = ["Lean", "Cycle", "Served", "Wrong", "Waste",
-                               "Lost%", "Upkeep", "Profit"]
-                st.dataframe(tbl, use_container_width=True)
-            else:
-                st.info("Play another round to see your trend.")
-
-    # ---------- ACT (Coaching Kata) ----------
-    st.markdown("<div id='jr-act'></div>", unsafe_allow_html=True)
-    _lastr = st.session_state.history[-1]["round"]
-    if _lastr not in st.session_state.coach_q:
-        _q = dict(coach_mc(_cfgd, _res, _diag, dec_unlocked,
-                           st.session_state.asked_coach))
-        # shuffle the answer order so the correct choice isn't always first
-        _pairs = list(enumerate(_q["options"]))
-        _random.Random(_lastr * 7 + 3).shuffle(_pairs)
-        _q["options"] = [t for _, t in _pairs]
-        _q["best"] = next(i for i, (oi, _) in enumerate(_pairs) if oi == _q["best"])
-        st.session_state.coach_q[_lastr] = _q
-        st.session_state.asked_coach.add(_q["id"])
-    _cq = st.session_state.coach_q[_lastr]
-    # open the decision expander for the waste the coach is pointing at
-    _coach_target = _cq.get("target_waste")
-    if _coach_target and _coach_target != "any":
-        _focus = _focus | {_coach_target}
-    _ckey2 = f"coachmc_{_lastr}"
-    _answered = st.session_state.get(_ckey2) is not None
-    with st.container(border=True):
-        st.markdown(f"### 🥋 ACT — Coaching Kata (Round {_lastr})")
-        st.caption("**Act** on what CHECK just showed: the five questions a lean "
-                   "coach asks to turn results into your next experiment. Answer #3 "
-                   "to unlock the **DO** button in the **sidebar**.")
-        st.markdown("**1. Target condition** — where you're headed:  \n"
-                    "*A lean, profitable shop — serve nearly everyone, few wrong "
-                    "drinks, little waste: a high Lean Score with healthy profit.*")
-        st.markdown(f"**2. Actual condition now** — the facts this rush:  \n"
-                    f"*Lean Score {_res.lean_score:.0f}/100 · served "
-                    f"{_res.served:.0f}/{_res.arrivals:.0f} · {_res.defects:.0f} wrong "
-                    f"· {_res.waste:.0f} wasted · {_res.abandon_pct:.0f}% walked out.*")
-        st.markdown(
-            f"""<div id='jr-coachq' class='jr-ask{' done' if _answered else ''}'>
-  <div class='jr-ask-tag'>{'✅ Answered — step 1 complete'
-                           if _answered
-                           else 'Required · this unlocks the DO button'}</div>
-  <div class='jr-ask-h'>3. What obstacle is most in your way?</div>
-  <div class='jr-ask-q'>{_mini_md(_cq['q'])}</div>
-  <div class='jr-ask-hint'>{'You can change your answer below at any time.'
-                            if _answered
-                            else '👇 Pick one of the options below — the ▶️ DO '
-                                 'button in the sidebar stays locked until you do.'}
-  </div>
-</div>""", unsafe_allow_html=True)
-        _choice = st.radio("Your answer:", _cq["options"], index=None, key=_ckey2,
-                           label_visibility="collapsed")
-        if _choice is None:
-            st.caption("🔒 The **DO** button (sidebar) stays locked until you "
-                       "choose — commit to a diagnosis first.")
-        else:
-            _pk = _cq["options"].index(_choice)
-            if _pk == _cq["best"]:
-                st.success("✅ Good read of the obstacle — now decide your next "
-                           "experiment in **PLAN** below and run it.")
-            else:
-                st.warning("That may not be the leanest read — think about which "
-                           "waste is hurting your score most, then plan a change.")
-            # the coach does NOT hand over the specific fix unless asked
-            _hkey = f"helped_{_lastr}"
-            if st.button("💡 Request additional help (reveal the next logical step)",
-                         key=f"helpbtn_{_lastr}"):
-                st.session_state[_hkey] = True
-            if st.session_state.get(_hkey):
-                st.markdown("🧑‍🏫 " + _cq["guidance"])
-                st.markdown(f"🔎 **Go and see:** {_cq['look']}.")
-                st.markdown(f"🎯 **Suggested next step:** {_cq['focus']}.")
-            else:
-                st.caption("Try to work out the next step yourself first. Stuck? "
-                           "Click **Request additional help** above.")
-            st.session_state.reflections[f"R{_lastr} coach"] = {
-                "q": _cq["q"], "a": f"chose: {_choice}"
-                + ("  ✓ (best)" if _pk == _cq["best"] else "")
-                + ("  [asked for help]" if st.session_state.get(_hkey) else "")}
-
-
-# ==========================================================================
-# DESIGN
-# ==========================================================================
-def layout_editor():
-    st.caption("**Drag the stations into the order a drink is made.** The image "
-               "below numbers each step ①–⑥ and draws the flow: 🟢 forward arrows "
-               "are good, 🔴 backward arrows are wasted walking. Aim for all green.")
+    st.divider()
     b1, b2 = st.columns(2)
-    if b1.button("↩︎ Reset to today's messy order", use_container_width=True):
-        C["order"] = list(SC["order"]); st.session_state.order_nonce += 1; st.rerun()
-    if b2.button("✨ Auto: perfect flow", use_container_width=True):
-        C["order"] = list(IDEAL_ORDER); st.session_state.order_nonce += 1; st.rerun()
-
-    if HAVE_DND:
-        try:
-            labels = [f"{STATION_EMOJI[s]}  {s}" for s in C["order"]]
-            back = {f"{STATION_EMOJI[s]}  {s}": s for s in C["order"]}
-            res = sort_items(labels, direction="horizontal",
-                             key=f"order_dnd_{st.session_state.order_nonce}")
-            new = [back[x] for x in res]
-            if new != C["order"]:
-                C["order"] = new
-                st.rerun()
-        except Exception:
-            _button_reorder()
-    else:
-        _button_reorder()
-
-    show_flow(C["order"])
-    bt = backtracks(C["order"])
-    legend = ("🟢 every arrow points forward — clean flow!" if bt == 0
-              else f"🔴 {bt} backward arrow(s) = the drink doubles back = wasted "
-                   "walking. Reorder to remove them.")
-    st.caption(f"Walking per drink: **{order_distance(C['order'])} steps**. {legend}")
+    b1.button("◀  Back to the simulation", use_container_width=True,
+              key="db_back", on_click=_go, args=("sim",))
+    b2.button("Continue to your report  →", use_container_width=True,
+              key="db_next", type="primary" if done else "secondary",
+              on_click=_go, args=("report",))
 
 
-def _button_reorder():
-    st.caption("Use ◀ ▶ to move a station along the counter:")
-    cols = st.columns(len(C["order"]))
-    for i, s in enumerate(C["order"]):
-        with cols[i]:
-            st.markdown(f"<div style='text-align:center'>{STATION_EMOJI[s]}<br>"
-                        f"<b>{STATION_ABBR[s]}</b></div>", unsafe_allow_html=True)
-            bl, br = st.columns(2)
-            if bl.button("◀", key=f"l{i}", disabled=(i == 0),
-                         use_container_width=True):
-                C["order"][i - 1], C["order"][i] = C["order"][i], C["order"][i - 1]
-                st.rerun()
-            if br.button("▶", key=f"r{i}", disabled=(i == len(C["order"]) - 1),
-                         use_container_width=True):
-                C["order"][i + 1], C["order"][i] = C["order"][i], C["order"][i + 1]
-                st.rerun()
-
-
-def _dec(key, title, five_s_tag, cost_txt):
-    _new = key in _new_this_round
-    # newly unlocked decisions are flagged 🆕 and opened so students notice them
-    exp = _new or key in _focus or (not guided)
-    _badge = "🆕 NEW · " if _new else ""
-    return st.expander(f"{_badge}{title}   ·   {five_s_tag}   ·   💲 {cost_txt}",
-                       expanded=exp)
-
-
-st.markdown("<div id='jr-plan'></div>", unsafe_allow_html=True)
-st.markdown("### 🛠️ PLAN — make your decisions (one per waste)")
-st.caption("Each of the **7 wastes** has a counter-measure. Notice **five of them "
-           "are exactly the 5 S's**; the last two (Defects, Waiting) need quality "
-           "tools and capacity. Cost per rush is shown on each.")
-
-# Call out decisions that just unlocked this round (flagged 🆕 and opened below).
-if _new_this_round:
-    _NAMES = {"overproduction": "Overproduction", "transport": "Transport",
-              "motion": "Motion", "overprocessing": "Overprocessing",
-              "inventory": "Inventory", "defects": "Defects", "waiting": "Waiting"}
-    _new_labels = [_NAMES[w] for w in WASTE_KEYS if w in _new_this_round]
-    st.success("🆕 **New this round:** " + ", ".join(_new_labels)
-               + " — the 🆕 decisions below just unlocked.")
-
-# The coach's directive shows here ONLY if the student requested help at the top.
-_lr = st.session_state.history[-1]["round"] if st.session_state.history else None
-_cq_prev = st.session_state.coach_q.get(_lr) if _lr else None
-if _cq_prev and st.session_state.get(f"helped_{_lr}"):
-    st.info(f"🎯 **Coach's suggested focus:** {_cq_prev['focus']}.  "
-            f"🔎 First look at **{_cq_prev['look']}**.")
-
-if not dec_unlocked:
-    st.info("Round 1 is your baseline — just press the flashing **RUN** button in "
-            "the **sidebar** (top-left). Decisions unlock next round.")
-
-with st.container():
-    # 1. Overproduction  →  5S #1 Sort
-    if "overproduction" in dec_unlocked:
-        with _dec("overproduction", "🏭 **Overproduction** — making drinks before "
-                  "they're ordered", "5S #1 Sort", "free"):
-            st.caption("**Sort: keep only what's needed.** Made-ahead drinks go "
-                       "stale (wrong orders) or get binned (waste). One-piece flow "
-                       "= make each drink only when ordered.")
-            C["batch"] = st.number_input("Blend batch size (drinks per cycle)", 1, 6,
-                                         C["batch"], help="1 = one at a time.")
-            C["premade"] = st.number_input("Pre-made drinks staged at open", 0, 20,
-                                           C["premade"])
-
-    # 2. Transport  →  5S #2 Set in order
-    if "transport" in dec_unlocked:
-        _tbase = 1.0 if order_distance(C["order"]) < order_distance(list(SC["order"])) else 0.0
-        _tsum = _tbase + (sim.LEAN_COSTS["conveyor"] if C.get("conveyor") else 0.0)
-        tcost = f"${_tsum:.0f}/rush" if _tsum else "free"
-        with _dec("transport", "🚚 **Transport** — drinks carried around the shop",
-                  "5S #2 Set in order", tcost):
-            layout_editor()
-            st.divider()
-            C["conveyor"] = st.toggle(
-                f"🛝 Conveyor belt between stations (${sim.LEAN_COSTS['conveyor']:.0f}"
-                "/rush)", value=bool(C.get("conveyor")))
-            st.caption("The equipment rep says a belt moves drinks between stations "
-                       "so nobody has to carry them — it cuts walking time by about "
-                       "45%, whatever order the stations are in.")
-
-    # 3. Motion  →  5S #3 Shine
-    if "motion" in dec_unlocked:
-        fcost = sim.FIVE_S_COST.get(C["five_s"], 0.0)
-        with _dec("motion", "🚶 **Motion** — workers hunting for tools & "
-                  "ingredients", "5S #3 Shine", f"${fcost:.0f}/rush"):
-            st.caption("**Shine: clean & label.** A tidy, labeled station means no "
-                       "searching. Higher levels cost more upkeep — decide how far "
-                       "up the ladder is worth paying for.")
-            _fs = list(sim.FIVE_S_ORDER)
-            C["five_s"] = st.selectbox(
-                "Clean & label level", _fs, index=_fs.index(C["five_s"]),
-                label_visibility="collapsed")
-            fcost = sim.FIVE_S_COST.get(C["five_s"], 0.0)
-            st.caption(f"**{C['five_s']}** — {sim.FIVE_S_DESC[C['five_s']]}  ·  "
-                       f"**${fcost:.0f}/rush**.")
-
-    # 4. Overprocessing  →  5S #4 Standardize
-    if "overprocessing" in dec_unlocked:
-        sl = sim.STANDARD_LEVELS[C["standard_level"]]
-        with _dec("overprocessing", "🔧 **Overprocessing** — every drink made a "
-                  "different, longer way", "5S #4 Standardize", f"${sl['cost']:.0f}/rush"):
-            st.caption("**Standardize: one agreed best method.** Cheaper tiers give "
-                       "most of the benefit; the top tier costs a lot for little "
-                       "extra.")
-            snames = [f"{i}. {l['name']}" for i, l in enumerate(sim.STANDARD_LEVELS)]
-            spick = st.selectbox("Standard work level", snames,
-                                 index=C["standard_level"],
-                                 label_visibility="collapsed")
-            C["standard_level"] = snames.index(spick)
-            sl = sim.STANDARD_LEVELS[C["standard_level"]]
-            st.caption(f"**{sl['name']}** — {sl['desc']}  ·  ${sl['cost']:.0f}/rush.")
-
-    # 5. Inventory  →  5S #5 Sustain
-    if "inventory" in dec_unlocked:
-        _isum = ((3 if C["pull"] else 0) + (1 if C["fifo"] else 0)
-                 + (sim.LEAN_COSTS["safety_stock"] if C.get("safety_stock") else 0))
-        icost = f"${_isum:.0f}/rush" if _isum else "free"
-        with _dec("inventory", "📦 **Inventory** — stock sitting around going stale",
-                  "5S #5 Sustain", icost):
-            st.caption("Three ways to control inventory: **(a) one-piece flow** "
-                       "(batch 1, no pre-made) — free, keeps stock low; **(b) FIFO "
-                       "rotation** ($1/rush) — a use-oldest-first rule that keeps "
-                       "whatever stock you hold *fresh*, so far less spoils; "
-                       "**(c) pull replenishment** ($3/rush) — kanban that restocks "
-                       "only what's used. Start with (a); add (b) or (c) only if "
-                       "stock is still a problem — don't pay for what you don't need.")
-            C["fifo"] = st.toggle("FIFO rotation (use oldest stock first)",
-                                  value=C["fifo"])
-            C["pull"] = st.toggle("Pull replenishment (kanban)", value=C["pull"])
-            C["safety_stock"] = st.toggle(
-                f"Safety stock — order extra of everything, just in case "
-                f"(${sim.LEAN_COSTS['safety_stock']:.0f}/rush)",
-                value=bool(C.get("safety_stock")))
-            st.caption("Your supplier offers a standing top-up order so you never "
-                       "run short of fruit mid-rush.")
-
-    # 6. Defects  →  quality tools (visual signals)
-    if "defects" in dec_unlocked:
-        vl = sim.VISUAL_LEVELS[C["visual_level"]]
-        with _dec("defects", "❌ **Defects** — wrong drinks that must be remade",
-                  "Quality tool: visual signals", f"${vl['cost']:.0f}/rush"):
-            st.caption("Make orders **visible** so they aren't mixed up. (Standard "
-                       "recipes above also cut defects.) Cheaper tiers give most of "
-                       "the benefit.")
-            vnames = [f"{i}. {l['name']}" for i, l in enumerate(sim.VISUAL_LEVELS)]
-            vpick = st.selectbox("Visual signal level", vnames,
-                                 index=C["visual_level"],
-                                 label_visibility="collapsed")
-            C["visual_level"] = vnames.index(vpick)
-            vl = sim.VISUAL_LEVELS[C["visual_level"]]
-            st.caption(f"**{vl['name']}** — {vl['desc']}  ·  ${vl['cost']:.0f}/rush.")
-
-    # 7. Waiting  →  capacity at the bottleneck
-    if "waiting" in dec_unlocked:
-        wage = sim.COSTS["employee_per_min"] * sim.HORIZON_S / 60.0
-        wcost = C["employees"] * wage + C["blenders"] * sim.COSTS["blender_per_rush"]
-        with _dec("waiting", "⏳ **Waiting** — customers & orders stuck in a queue",
-                  "Capacity at the bottleneck", f"${wcost:.0f}/rush"):
-            st.caption("Add people/equipment **only at the station that's backed "
-                       "up** — capacity costs money every rush. Test it first!")
-            C["mode"] = st.radio("Staffing model",
-                                 ["Whole-order", "Specialized stations"],
-                                 index=0 if C["mode"] == "Whole-order" else 1)
-            if C["mode"] == "Whole-order":
-                C["employees"] = st.number_input("Baristas", 1, 6, C["employees"])
-            else:
-                scg = st.columns(3)
-                C["spec_prep"] = scg[0].number_input("Prep", 0, 5, C["spec_prep"])
-                C["spec_blend"] = scg[1].number_input("Blend", 0, 5, C["spec_blend"])
-                C["spec_finish"] = scg[2].number_input("Finish", 0, 5, C["spec_finish"])
-                C["employees"] = max(1, C["spec_prep"] + C["spec_blend"]
-                                     + C["spec_finish"])
-                st.caption(f"Total baristas: **{C['employees']}**")
-            C["blenders"] = st.number_input("🌀 Blenders ($12/rush each)", 1, 4,
-                                            C["blenders"])
-            st.caption(f"The bar comfortably fits **{sim.CROWD_FREE_STAFF} people**; "
-                       "past that they work around each other and every task takes "
-                       "a little longer.")
-
-    # ---- The rep's catalogue: paid extras that are NOT lean counter-measures ----
-    if dec_unlocked:
-        _buy_on = [nm for f, nm in EXTRA_BUYS
-                   if C.get(f) and f not in ("conveyor", "safety_stock")]
-        _shelf_cost = sum(
-            (sim.UPGRADE_COSTS.get(f, 0.0) if f != "premium_ingredients"
-             else sim.COSTS["premium_extra_per_drink"] * 40)
-            for f, _ in EXTRA_BUYS if C.get(f) and f in
-            ("promo_push", "robo_juicer", "staging_fridge", "signage",
-             "premium_ingredients"))
-        with st.expander(
-                "🛒 **Tempting upgrades** — the sales rep is in the shop again"
-                + (f"   ·   💲 ${_shelf_cost:.0f}/rush committed" if _buy_on
-                   else "   ·   💲 nothing bought"),
-                expanded=False):
-            st.caption("None of these is a lean counter-measure — they're things "
-                       "a shop *can* buy. Each shows its real price. Whether any of "
-                       "them earns that money back in **your** shop is exactly the "
-                       "judgement the last objective is testing. Use **Test the "
-                       "profit impact** below before you commit.")
-            for _f, _label, _price, _pitch in UPGRADE_SHELF:
-                C[_f] = st.toggle(f"{_label}  ·  {_price}", value=C.get(_f, False),
-                                  key=f"buy_{_f}")
-                st.caption(_pitch)
-
-    # always show the workflow picture + the derived 5S board so the two
-    # frameworks stay front-and-center
-    if "transport" not in dec_unlocked:
-        st.caption(f"Current drink path: {order_distance(C['order'])} steps.")
-        show_flow(C["order"])
-    if dec_unlocked:
-        st.markdown("**Your 5S progress** (the five S's are five of the seven "
-                    "waste fixes above):")
-        render_5s(cfg_from_state(C))
-
-cfg = cfg_from_state(C)
-
-# ---- PLAN · rehearse + profitability + commit (kept together with decisions) ----
-if st.session_state.last_result is not None and dec_unlocked:
-    _resL = st.session_state.last_result
-    _cfgL = st.session_state.last_cfg
-    with st.container(border=True):
-        st.markdown("### 📝 PLAN · rehearse — preview the profit of your options")
-        st.caption("Your decisions above are the only place changes are made — this "
-                   "just previews them. Nothing here commits or advances the round.")
-
-        def _plan_sig(c):
-            return _spend_sig(c)
-
-        # ---- dry-run: auto-computed whenever the plan changes (cached) ----
-        chg = plan_changes(_cfgL, cfg)
-        if chg:
-            st.markdown("**Your plan changes vs the last rush:** " + "; ".join(chg))
-            sig = _plan_sig(cfg)
-            cache = st.session_state.get("dryrun_cache")
-            if not cache or cache[0] != sig:
-                with st.spinner("Previewing your plan…"):
-                    _bd = run_sim(_clone(_cfgL), base_seed=ANALYSIS_SEED)
-                    _pd = run_sim(_clone(cfg), base_seed=ANALYSIS_SEED)
-                cache = (sig, dict(name="; ".join(chg)[:90], added_cost=0,
-                                   d_profit=_pd.profit - _bd.profit,
-                                   d_score=_pd.lean_score - _bd.lean_score,
-                                   d_served=_pd.served - _bd.served))
-                st.session_state.dryrun_cache = cache
-                st.session_state.tested = [c for c in st.session_state.tested
-                                           if c.get("added_cost") != 0] + [cache[1]]
-            _t = cache[1]
-            good = _t["d_profit"]
-            st.markdown(f"**Dry-run preview:** profit **{good:+.0f}\\$**, served "
-                        f"{_t['d_served']:+.0f}, Lean **{_t['d_score']:+.0f}** "
-                        "*vs the last rush.*")
-            if good > 3:
-                st.success("👍 Looks worth it — commit your plan below.")
-            elif good >= -1:
-                st.info("😐 Barely moves profit — is it aimed at the coach's obstacle?")
-            else:
-                st.warning("👎 Profit would drop — a change may cost more than it "
-                           "returns. Adjust a decision above.")
-        else:
-            st.caption("No changes yet — adjust a decision above (the coach said "
-                       "where to look) and this will preview its effect automatically.")
-
-        # ---- profitability test — re-run anytime, tests your CURRENT plan ----
-        with st.expander("🔬 Test the profit impact of each change *(optional)*",
-                         expanded=False):
-            st.caption("Tests the levers **unlocked this round** against your "
-                       "**current plan** — change a decision and run it again to "
-                       "re-test.")
-            if st.button("🔬 Run / re-run the test", key=f"roibtn_{rnd}"):
-                with st.spinner("Testing each available change…"):
-                    _opts = next_step_options(cfg, allowed=dec_unlocked)
-                    st.session_state["roirows"] = (
-                        _plan_sig(cfg),
-                        [test_one_option(cfg, o) for o in _opts])
-            _cache = st.session_state.get("roirows")
-            _rows = _cache[1] if _cache else None
-            if _rows and _cache[0] == _plan_sig(cfg):
-                for r in sorted(_rows, key=lambda x: -x["d_profit"]):
-                    st.markdown(f"• **{r['name']}** — cost **\\${r['added_cost']:.0f}"
-                                f"/rush** → profit **{r['d_profit']:+.0f}\\$**, "
-                                f"served **{r['d_served']:+.0f}**, Lean "
-                                f"**{r['d_score']:+.0f}**")
-                show_impact_effort(_rows)
-            elif _rows:
-                st.info("Your plan changed since the last test — click **Run / "
-                        "re-run the test** to refresh.")
-            else:
-                st.caption("Click **Run / re-run the test** to see the profit impact "
-                           "of each available change on your current plan.")
-
-    # ---- REQUIRED: commit your plan before you can DO ----
-    with st.container(border=True):
-        st.markdown("### 🎯 PLAN · commit — lock in your experiment *(required)*")
-        st.markdown("Before you run: **what do you predict your plan will do this "
-                    "round?** (Toyota Kata step 4–5: name your experiment & your "
-                    "prediction.)")
-        _pc = st.radio("Your prediction:", [
-            "It will improve BOTH my Lean Score and profit",
-            "It will improve the Lean Score, even if profit dips",
-            "It's an experiment — it might backfire (and that's OK to learn)",
-            "I'm re-running the same plan to confirm the result"],
-            index=None, key=f"plancommit_{rnd}", label_visibility="collapsed")
-        if _pc is None:
-            st.caption("🔒 Commit a prediction to unlock the **DO** button.")
-        else:
-            st.session_state.reflections[f"R{rnd} plan prediction"] = {
-                "q": "Prediction before running", "a": _pc}
-            st.success("Locked in — press ▶️ **DO** in the sidebar. Next round's "
-                       "CHECK will tell you if you were right.")
-
-st.markdown("<div id='jr-do'></div>", unsafe_allow_html=True)
-if need_coach:
-    st.warning("✍️ **Answer the coach's question at the top** to unlock the DO "
-               "button — diagnosing before acting is the whole skill.")
-    _wj, _ = st.columns([1, 2])
-    with _wj:
-        jr_jump_button("⬆️ Take me to the coach's question")
-
-
-# ==========================================================================
-# run + results
-# ==========================================================================
-def summarize(res, cfg):
-    # capture the student's decisions this round too, for the LMS report
-    decisions = []
-    if backtracks(cfg_layout_order(cfg)) == 0:
-        decisions.append("ordered flow")
-    if cfg.five_s != "Disorganized":
-        decisions.append(f"5S:{cfg.five_s}")
-    if cfg.standard_level > 0:
-        decisions.append(f"std:{sim.STANDARD_LEVELS[cfg.standard_level]['name']}")
-    if cfg.visual_level > 0:
-        decisions.append(f"visual:{sim.VISUAL_LEVELS[cfg.visual_level]['name']}")
-    if cfg.pull_replenishment:
-        decisions.append("pull")
-    if cfg.fifo_rotation:
-        decisions.append("fifo")
-    if cfg.batch_size > 1:
-        decisions.append(f"batch×{cfg.batch_size}")
-    if cfg.premade > 0:
-        decisions.append(f"premade×{cfg.premade}")
-    decisions.append(f"{cfg.employees} staff/{cfg.blenders} blndr")
-    decisions += [nm for f, nm in EXTRA_BUYS if getattr(cfg, f)]
-    return dict(round=st.session_state.round, lean_score=res.lean_score,
-                avg_cycle=res.avg_cycle, served=res.served,
-                arrivals=res.arrivals, defects=res.defects, waste=res.waste,
-                abandon_pct=res.abandon_pct, avg_wip=res.avg_wip,
-                walk_units=res.walk_units, profit=res.profit, upkeep=res.upkeep,
-                decisions=", ".join(decisions))
-
-
-if run:
-    with st.spinner("Simulating the rush…"):
-        res = run_sim(cfg, base_seed=1000 + rnd)
-    st.session_state.last_result = res
-    st.session_state.last_cfg = copy.deepcopy(cfg)
-    # JSON-able snapshot of exactly what was run + its seed, so a resumed session
-    # can rebuild last_result deterministically (see the rebuild block below).
-    st.session_state.last_cdict = dict(C)
-    st.session_state.last_seed = 1000 + rnd
-    st.session_state.history.append(summarize(res, cfg))
-    st.session_state.round += 1
-    st.session_state.tested = []
-    st.session_state.staged = []
-    st.session_state.scroll_top = True     # jump to top so results are seen first
-    _autosave()                            # persist the finished rush / new round
-    st.rerun()
-
-res = st.session_state.last_result
-cfg_done = st.session_state.last_cfg
-
-if res is not None:
-    hist = st.session_state.history
-    # the core is complete ONLY when all FOUR objectives are met: every waste
-    # addressed, Lean Score high enough, the shop running a profit, and every
-    # dollar of spending earning its keep. (The full
-    # checklist with what's left is shown up in the CHECK panel.)
-    _obj_done = objectives_status(cfg_done, res)
-    _goal_reached = _obj_done["all_ok"]
-    _was_reached = st.session_state.get("goal_reached_once", False)
-    if _goal_reached:
-        st.session_state.goal_reached_once = True
-    else:
-        st.session_state.debrief_ready = False
-
-    # ======================================================================
-    # 🎓 DEBRIEF — unlocks once every waste has a sensible decision. Then the
-    # student may switch to Free play to keep experimenting.
-    # ======================================================================
-    if _goal_reached:
-        st.divider()
-        with st.container(border=True):
-            if not _was_reached:
-                st.success(
-                    "🎉 **Objectives met — the core simulation is complete!** All 7 "
-                    f"wastes addressed, Lean Score **{res.lean_score:.0f}**, and a "
-                    f"healthy profit of **${res.profit:.0f}**. Here's your detailed "
-                    "debrief. **Free play** is now unlocked in the sidebar if you "
-                    "want to keep experimenting.")
-            # persist a completion record for the Director (once; no-op when
-            # storage is unconfigured). There is no completion code: what the
-            # student submits is the PDF report itself.
-            if not st.session_state.get("_completion_recorded"):
-                store.record_completion(game, sid, score=round(res.profit, 1))
-                st.session_state["_completion_recorded"] = True
-                _autosave()
-            st.markdown("## 🎓 Debrief — make sense of the whole game")
-            st.caption("Research on simulations is blunt: most of the learning "
-                       "happens *here*, in the reflection — not in the playing. "
-                       "Answer in your own words; your answers go on your report.")
-
-            # computed synthesis to anchor the reflection
-            hh = pd.DataFrame(hist)
-            jumps = hh["lean_score"].diff()
-            if len(jumps) > 1 and jumps[1:].notna().any():
-                bi = jumps[1:].idxmax()
-                big_round = int(hh.loc[bi, "round"])
-                big_delta = jumps[bi]
-                big_dec = hh.loc[bi, "decisions"]
-            else:
-                big_round, big_delta, big_dec = None, 0, ""
-            first_s, last_s = hh["lean_score"].iloc[0], hh["lean_score"].iloc[-1]
-            first_p, last_p = hh["profit"].iloc[0], hh["profit"].iloc[-1]
-            cS = st.columns(3)
-            cS[0].metric("Lean Score", f"{last_s:.0f}", f"{last_s-first_s:+.0f} vs start")
-            cS[1].metric("Profit", f"${last_p:.0f}", f"${last_p-first_p:+.0f} vs start")
-            cS[2].metric("Rounds of kaizen", f"{len(hist)}")
-            k1, k2 = st.columns(2)
-            k1.markdown("Lean Score across rounds"); k1.line_chart(hh.set_index("round")[["lean_score"]])
-            k2.markdown("Profit across rounds"); k2.line_chart(hh.set_index("round")[["profit"]])
-            if big_round:
-                st.info(f"📈 Your biggest single-round jump was **+{big_delta:.0f} "
-                        f"Lean points in Round {big_round}**, when you changed: "
-                        f"*{big_dec}*.")
-
-            # ---- detailed per-waste summary: how you tackled each of the 7 ----
-            st.markdown("### 📋 How you tackled each of the 7 wastes")
-            _dord = cfg_layout_order(cfg_done)
-            _decmap = {
-                "Transport": (f"line = {order_distance(_dord)} steps"
-                              + (", in order ✓" if backtracks(_dord) == 0
-                                 else f", {backtracks(_dord)} backtrack(s)")),
-                "Overproduction": (f"batch {cfg_done.batch_size}, pre-made "
-                                   f"{cfg_done.premade}"),
-                "Motion": f"5S: {cfg_done.five_s}",
-                "Overprocessing": ("standard work: "
-                                   f"{sim.STANDARD_LEVELS[cfg_done.standard_level]['name']}"),
-                "Inventory": ", ".join(
-                    [t for t, on in (("one-piece flow",
-                                      cfg_done.batch_size == 1 and cfg_done.premade == 0),
-                                     ("pull", cfg_done.pull_replenishment),
-                                     ("FIFO", cfg_done.fifo_rotation)) if on]
-                ) or "none yet",
-                "Defects": f"visual: {sim.VISUAL_LEVELS[cfg_done.visual_level]['name']}",
-                "Waiting": f"{cfg_done.employees} staff / {cfg_done.blenders} blenders",
-            }
-            _lean_map = {"Transport": "5S Set-in-order", "Overproduction": "5S Sort",
-                         "Motion": "5S Shine", "Overprocessing": "5S Standardize",
-                         "Inventory": "5S Sustain", "Defects": "Visual signals",
-                         "Waiting": "Capacity"}
-            st.dataframe(pd.DataFrame([{
-                "Waste": x["waste"],
-                "Lean tool": _lean_map.get(x["waste"], ""),
-                "What you did": _decmap.get(x["waste"], ""),
-                "Result": RAG[x["flag"]],
-            } for x in diag]), hide_index=True, use_container_width=True)
-            st.caption("🟢 solved · 🟡 improving · 🔴 still a problem. Five of the "
-                       "seven wastes are fixed by the 5 S's; Defects and Waiting need "
-                       "quality tools and capacity.")
-
-            # ---- your lean journey narrative ----
-            _reds = sum(1 for x in diag if x["flag"] == "red")
-            _greens = sum(1 for x in diag if x["flag"] == "green")
-            st.markdown("### 🧭 Your lean journey")
-            st.markdown(
-                f"You inherited a shop scoring **{first_s:.0f}** with heavy waste. "
-                f"Over **{len(hist)} rounds of kaizen** you raised it to "
-                f"**{last_s:.0f}** and turned profit from **\\${first_p:.0f}** to "
-                f"**\\${last_p:.0f}**. You now have **{_greens}/7 wastes fully "
-                f"under control**" + (f" ({_reds} still red)" if _reds else "")
-                + ". That is exactly how real lean works — not one big fix, but "
-                "many small, evidence-based improvements, repeated.")
-
-            def _dbf(qid, prompt, ph):
-                a = st.text_area(prompt, key=f"debrief_{qid}", height=68,
-                                 placeholder=ph)
-                if a.strip():
-                    st.session_state.reflections[f"Debrief · {qid}"] = {
-                        "q": prompt, "a": a}
-                    return True
-                st.session_state.reflections.pop(f"Debrief · {qid}", None)
-                return False
-
-            _answers = [
-                _dbf("biggest_lever",
-                     "1. Which single change moved your Lean Score the most — and "
-                     "*why* did that one do so much?",
-                     "e.g., putting the stations in order removed all the backtracking…"),
-                _dbf("not_worth_it",
-                     "2. Did any change cost more than it returned? Which, and how "
-                     "did you know it wasn't worth it?",
-                     "e.g., the top visual-signal tier — Δ profit was negative in test…"),
-                _dbf("prediction",
-                     "3. When you dry-ran your plan in ACT, were your predictions "
-                     "usually right? What did a *wrong* prediction teach you?",
-                     "e.g., I thought a 2nd blender would help but the bottleneck was…"),
-                _dbf("transfer",
-                     "4. Transfer: pick a real process (a café, clinic, office, your "
-                     "email). Which 2 of the 7 wastes does it suffer from, and what's "
-                     "the cheapest first countermeasure?",
-                     "e.g., my clinic's check-in has Waiting and Motion because…"),
-            ]
-            _refl_done = sum(_answers)
-            if _refl_done < 4:
-                st.caption(f"{_refl_done}/4 written reflections answered.")
-
-            # ---- knowledge check (MCQ) — required for a COMPLETE report ----
-            st.divider()
-            st.markdown("### 🧠 Knowledge check")
-            st.caption("Answer all of these to show what you took away — they, and "
-                       "the reflections above, are what make your report count as "
-                       "COMPLETE. Your answers appear on the report.")
-            _quiz_correct = _quiz_answered = 0
-            for _qi, _qz in enumerate(DEBRIEF_QUIZ):
-                _opts = list(_qz["options"])
-                _random.Random(f"{SC['sid']}-quiz-{_qi}").shuffle(_opts)
-                _sel = st.radio(f"**{_qi + 1}. {_qz['q']}**", _opts, index=None,
-                                key=f"dquiz_{_qi}")
-                if _sel is not None:
-                    _quiz_answered += 1
-                    _ok = _sel == _qz["answer"]
-                    _quiz_correct += int(_ok)
-                    (st.success if _ok else st.error)(
-                        ("✓ Correct. " if _ok else "✗ Not quite. ") + _qz["explain"])
-                    st.session_state.reflections[f"Knowledge check · Q{_qi + 1}"] = {
-                        "q": _qz["q"],
-                        "a": f"{_sel}  [{'correct' if _ok else 'incorrect'}]"}
-                else:
-                    st.session_state.reflections.pop(
-                        f"Knowledge check · Q{_qi + 1}", None)
-            _quiz_done = _quiz_answered >= len(DEBRIEF_QUIZ)
-            if _quiz_done:
-                st.info(f"Knowledge check: **{_quiz_correct}/{len(DEBRIEF_QUIZ)}** "
-                        "correct.")
-            else:
-                st.caption(f"{_quiz_answered}/{len(DEBRIEF_QUIZ)} knowledge-check "
-                           "questions answered.")
-
-            st.session_state.debrief_ready = bool(_refl_done >= 4 and _quiz_done)
-            if st.session_state.debrief_ready:
-                st.success("✅ Debrief complete — add your name in the sidebar and "
-                           "download your PDF report below. 👏")
-            else:
-                st.warning("Finish all four reflections **and** the knowledge check "
-                           "for your report to count as COMPLETE. You can download "
-                           "it before then, but it will be stamped INCOMPLETE.")
-
-            # ---- THE REVEAL: what was actually worth doing (held until now) ----
-            st.divider()
-            st.markdown("### 🪜 What was worth doing? — *revealed*")
-            st.caption("We held this back on purpose: the goal was for you to "
-                       "*discover* it. Here's how much each of **your** improvements "
-                       "was really adding to your final shop's profit — its value "
-                       "against its cost.")
-            with st.spinner("Analysing your decisions…"):
-                roi = debrief_roi(cfg_done, SC)
-            if roi:
-                show_impact_effort(roi)
-                roi_sorted = sorted(roi, key=lambda r: -r["d_profit"])
-                st.dataframe(pd.DataFrame([{
-                    "Your decision": r["short"],
-                    "Cost $/rush": f"{r['added_cost']:.0f}",
-                    "Profit it added": f"${r['d_profit']:+.0f}",
-                    "Lean pts added": f"{r['d_score']:+.0f}",
-                } for r in roi_sorted]), hide_index=True, use_container_width=True)
-                best = roi_sorted[0]
-                st.info(f"🏆 Your highest-return decision was **{best['short']}** "
-                        f"(added \\${best['d_profit']:+.0f} for \\${best['added_cost']:.0f}"
-                        "/rush). Notice the cheapest organizing changes usually gave "
-                        "the most **per dollar** — that is the answer to *what to do "
-                        "first*.")
-            else:
-                st.caption("You didn't change much from the messy starting shop, so "
-                           "there's little to compare. Try another scenario and act "
-                           "on the coach's advice to see the returns build up.")
-            st.markdown("**The general rule your game just demonstrated — the lean "
-                        "priority ladder:**")
-            st.dataframe(LADDER, hide_index=True, use_container_width=True)
-
-
-with st.expander("📄 Progress report — download for your LMS", expanded=False):
-    st.markdown("Generate a report of your scenario, decisions, scores, and "
-                "reflections to submit to your course site.")
-    if not st.session_state.student:
+def render_report_page():
+    ss = st.session_state
+    st.header("📄 Progress report — download for your LMS")
+    st.markdown("A PDF of your scenario, round-by-round results, a round journal "
+                "(decisions → prediction → coach diagnosis), your debrief "
+                "reflections and the knowledge check — ready to upload to your "
+                "course site.")
+    if not (ss.student or "").strip():
         st.caption("Tip: enter your name / student ID in the sidebar so it appears "
                    "on the report.")
-    if not st.session_state.history:
+    if not ss.history:
         st.info("Play at least one round first, then come back to download.")
     else:
         # The report is ALWAYS downloadable — a partial one is still a record of
         # the work done. It simply says on its first page whether it is complete,
         # and exactly what is outstanding if it isn't.
-        _rs = report_status()
-        if _rs["complete"]:
+        rs = report_status()
+        if rs["complete"]:
             st.success("✅ **This report is COMPLETE** — objectives met and the "
                        "debrief finished. It is marked COMPLETE on page 1.")
         else:
@@ -4121,30 +3884,796 @@ with st.expander("📄 Progress report — download for your LMS", expanded=Fals
                 "⚠️ **This report is INCOMPLETE.** You can still download and "
                 "submit it, and it will be clearly marked INCOMPLETE on page 1, "
                 "listing what is outstanding:\n\n"
-                + "\n".join(f"- {m}" for m in _rs["missing"]))
-        safe = (st.session_state.student or "student").replace(" ", "_")
-        _tag = "" if _rs["complete"] else "_INCOMPLETE"
-        # Build on demand, not on every rerun: assembling the PDF costs about a
-        # quarter-second of server time, which is far more than a whole click
-        # otherwise costs, and it was being paid whether or not anyone downloaded.
+                + "\n".join(f"- {m}" for m in rs["missing"]))
+        safe = "".join(ch if ch.isalnum() else "_"
+                       for ch in (ss.student or "student")).strip("_") or "student"
+        tag = "" if rs["complete"] else "_INCOMPLETE"
+        # Build on demand, not on every rerun: assembling the PDF is far more
+        # expensive than a normal click.
         if st.button("📄 Generate report", use_container_width=True,
                      type="primary", key="gen_report_main"):
             with st.spinner("Building your PDF report…"):
-                st.session_state["report_pdf"] = build_report_pdf()
-                st.session_state["report_complete"] = _rs["complete"]
-        if st.session_state.get("report_pdf"):
+                ss["report_pdf"] = build_report_pdf()
+                ss["report_complete"] = rs["complete"]
+        if ss.get("report_pdf"):
             st.download_button(
-                ("⬇️  Download PDF report" if st.session_state.get("report_complete")
+                ("⬇️  Download PDF report" if ss.get("report_complete")
                  else "⬇️  Download PDF report (marked incomplete)"),
-                data=st.session_state["report_pdf"],
-                file_name=f"juicetification_{safe}_sc{SC['sid']}{_tag}.pdf",
+                data=ss["report_pdf"],
+                file_name=f"juicetification_{safe}_sc{SC['sid']}{tag}.pdf",
                 mime="application/pdf", use_container_width=True,
                 key="dl_report_main")
+            st.caption("Generated just now. Click **Generate report** again after "
+                       "you answer more, to refresh it.")
         else:
             st.caption("Press **Generate report** to build your PDF.")
-        st.caption("A ready-to-submit PDF with your scenario, round-by-round "
-                   "results, decisions, tested options, reflections, and knowledge "
-                   "check.")
+    st.divider()
+    b1, b2 = st.columns(2)
+    b1.button("◀  Back to the simulation", use_container_width=True,
+              key="rep_back_sim", on_click=_go, args=("sim",))
+    b2.button("🎓  Back to the debrief", use_container_width=True,
+              key="rep_back_debrief", on_click=_go, args=("debrief",))
+
+
+# ---- page navigation (always visible, top of the main area) ----
+render_nav()
+
+if st.session_state.page == "sim":
+    # One-time orientation, shown only while planning the very first round. It sets
+    # expectations up front (time, save behaviour, the required/reviewed debrief) so
+    # students who skip the printed handout still know the ground rules.
+    if st.session_state.round == 1 and not st.session_state.history:
+        _saves = (sid and store.enabled())
+        with st.expander("ℹ️  Before you begin — please read", expanded=True):
+            st.markdown(
+                "- ⏱️ **Plan about 30–45 minutes.** It's best done in one sitting.\n"
+                + ("- 💾 **Your progress saves automatically** — you can close the tab and "
+                   "return to the same link later to pick up where you left off.\n"
+                   if _saves else
+                   "- 💾 **Finish in one sitting.** Your work is kept only for this browser "
+                   "session, so don't leave the tab idle for long or refresh — you may "
+                   "lose your progress.\n")
+                + "- 🎓 **There is a required debrief.** The game ends with short written "
+                  "reflections and a knowledge check that are **required and reviewed by "
+                  "your instructor**. You can download your report at any time, but it is "
+                  "stamped **INCOMPLETE** until they are done. Play to *learn the ideas*, "
+                  "not just to hit the numbers.\n"
+                + "- ▶️ **How each round works:** run the rush → read what went wrong → "
+                  "answer the coach → change one decision → run again, until you've "
+                  "addressed all seven wastes with a solid Lean Score and a profit.\n"
+                + "- 🧭 **Pages (buttons at the top):** *Simulation* · *Past rounds* "
+                  "(review any earlier rush, copy its decisions, or rewind to it) · "
+                  "*Debrief* · *Report*. Your answers are kept when you switch pages.")
+
+    st.markdown(f"🏪 {SC['briefing']}")
+    st.subheader(plan["title"])
+    st.info(f"🎯 **Your goal:** {plan['focus']}")
+    st.caption(f"💡 **Why this matters:** {plan['why']}  ·  Lean idea: {plan['concept']}")
+    st.caption("🔁 This page is one turn of the **PDCA / kaizen** cycle, read as a "
+               "loop: **CHECK** your last rush's result & wastes (top) → **ACT** on it "
+               "with the coach to choose your next move → **PLAN** that change in your "
+               "decisions → **DO** it with the RUN button. *Act flows straight into the "
+               "next Plan — that is kaizen.*")
+
+
+
+
+    # ======================================================================
+    # CHECK + ACT (top) — after a rush, show the result, then the Coaching Kata
+    # (Act), so pressing DO and jumping to the top lands on them in PDCA order.
+    # ======================================================================
+    _res = st.session_state.last_result
+    _cfgd = st.session_state.last_cfg
+    if _res is None and RESULT_MISSING:
+        # A rush was run but its result is gone (refresh / reconnect / restored save
+        # from an older version). Say so plainly and give a way forward — this is the
+        # state that used to look like "the coach's question disappeared".
+        with st.container(border=True):
+            st.warning("↩︎ **Your last rush couldn't be restored.** The page was "
+                       "refreshed or reconnected, so the CHECK panel and the coach's "
+                       "question for that round aren't available.")
+            st.markdown("**Nothing is lost:** your rounds, decisions and every answer "
+                        "you've given are still recorded and still go on your report. "
+                        "Your decisions below are exactly where you left them.")
+            st.markdown("▶️ Press **DO — run the rush** in the sidebar to run the next "
+                        "round; the result panel and a fresh coach's question come "
+                        "back with it.")
+            st.caption("You can also generate your report from **Report & progress** "
+                       "in the sidebar at any time.")
+    if _res is not None:
+        res = _res
+        cfg_done = _cfgd
+        diag = _diag = sim.seven_wastes_diagnostic(cfg_done, res)
+        hist = st.session_state.history
+        prev = hist[-2] if len(hist) > 1 else None
+
+        def d(cur, key):
+            if not prev:
+                return None
+            v = cur - prev[key]
+            return f"{v:+.0f}" if abs(v) >= 1 else f"{v:+.1f}"
+
+        # ---------- CHECK (all together) ----------
+        st.markdown("<div id='jr-check'></div>", unsafe_allow_html=True)
+        st.markdown(f"## 🔍 CHECK — your last rush "
+                    f"(🏆 Lean **{res.lean_score:.0f}/100** · 💵 **\\${res.profit:.0f}**)")
+        st.progress(min(1.0, res.lean_score / 100))
+        m = st.columns(4)
+        m[0].metric("Avg cycle time", f"{res.avg_cycle:.0f}s",
+                    d(res.avg_cycle, "avg_cycle"), delta_color="inverse")
+        m[1].metric("Served / arrived", f"{res.served:.0f}/{res.arrivals:.0f}",
+                    d(res.served, "served"))
+        m[2].metric("Wrong orders", f"{res.defects:.0f}",
+                    d(res.defects, "defects"), delta_color="inverse")
+        m[3].metric("Profit", f"${res.profit:.0f}", d(res.profit, "profit"))
+        st.caption(f"📊 **Predictability:** cycle time varied **± {res.avg_cycle_sd:.0f}s** "
+                   "across the simulated rushes — standard work shrinks this spread "
+                   "(see the *Variability* tab).")
+
+        # ---------- was your PLAN·commit prediction correct? ----------
+        _pred, _right, _fact = prediction_verdict(len(hist) - 1)
+        if _pred and _fact:
+            _fact = _fact.replace("$", "\\$")
+            if _right is True:
+                st.success(f"🎯 **Your prediction was right!** You predicted *“{_pred}”* "
+                           f"— and it happened: {_fact}.")
+            elif _right is False:
+                st.error(f"🔄 **Your prediction missed.** You predicted *“{_pred}”*, but "
+                         f"the rush gave {_fact}. That gap is the most useful thing to "
+                         "learn from — why did it differ?")
+            else:
+                st.info(f"🧪 **You ran an experiment** (*“{_pred}”*) — result: {_fact}. "
+                        "Every experiment teaches you something, win or lose.")
+
+        # ---------- progress toward the debrief: the FOUR objectives ----------
+        _obj = objectives_status(cfg_done, res)
+        _done, _total, _items = _obj["done"], _obj["total"], _obj["items"]
+        _obj_met = sum([_obj["wastes_ok"], _obj["score_ok"], _obj["profit_ok"],
+                        _obj["spend_ok"]])
+        _wrows = _obj["waste_rows"]
+        st.markdown(
+            f"**🎯 Objectives to complete the simulation ({_obj_met}/4 met)**  \n"
+            f"{'✅' if _obj['wastes_ok'] else '⬜'} Every waste worth addressing is "
+            f"addressed — **{_done}/{_total}**  \n"
+            f"{'✅' if _obj['score_ok'] else '⬜'} Lean Score ≥ {LEAN_TARGET} — "
+            f"**{res.lean_score:.0f}**  \n"
+            f"{'✅' if _obj['profit_ok'] else '⬜'} Running a profit (> \\$0) — "
+            f"**\\${res.profit:.0f}**  \n"
+            f"{'✅' if _obj['spend_ok'] else '⬜'} Every dollar you spend earns its "
+            f"keep — **{len(_wrows)}** purchase"
+            f"{' is' if len(_wrows) == 1 else 's are'} not paying for "
+            f"{'itself' if len(_wrows) == 1 else 'themselves'}")
+        st.progress(_obj_met / 4.0)
+        if _obj["all_ok"] or _debrief_entry() is not None:
+            with st.container(border=True):
+                if st.session_state.pop("just_completed", False):
+                    st.balloons()
+                    st.success("🎉 **Objectives met — the core simulation is complete!** "
+                               "Your debrief is now open on its own page. **Free play** "
+                               "is unlocked in the sidebar if you want to keep "
+                               "experimenting.")
+                else:
+                    st.success("✅ Objectives met — your **🎓 Debrief** page is unlocked.")
+                st.button("🎓  Go to the debrief  →", type="primary",
+                          key="go_debrief_top", on_click=_go, args=("debrief",))
+        if not _obj["all_ok"]:
+            if not _obj["wastes_ok"]:
+                with st.expander("Which wastes are still left?", expanded=True):
+                    st.caption("A waste ticks when its counter-measure is in place — "
+                               "**or** when nothing available for it would pay for "
+                               "itself here. Not spending is a real lean decision.")
+                    for nm, ok, note in _items:
+                        st.markdown(f"{'✅' if ok else '⬜'} {nm}"
+                                    + (f"  \n&nbsp;&nbsp;&nbsp;*{note}*" if note else ""))
+            if _wrows:
+                with st.expander("Which spending isn't earning its keep?",
+                                 expanded=True):
+                    st.caption("Each line re-runs your rush with **that one step "
+                               "undone** — everything else identical. A negative "
+                               "return means the shop makes MORE money without it. "
+                               "Drop it back a step, or spend the money where it "
+                               "does work.")
+                    for r in sorted(_wrows, key=lambda x: x["d_profit"]):
+                        st.markdown(f"🔻 **{r['name']}** ({r['step']}) — costs "
+                                    f"**\\${r['cost']:.0f}/rush**, returns "
+                                    f"**{r['d_profit']:+.0f}\\$**")
+
+        dc1, dc2 = st.columns([1.05, 1])
+        with dc1:
+            st.markdown("**The 7 wastes** (🟢 ok · 🟡 watch · 🔴 problem)")
+            show_seven_wastes(diag)
+        with dc2:
+            st.markdown("**Your 5S** (5 of these fix 5 of the wastes)")
+            show_five_s(cfg_done)
+        _show = [x for x in diag if (not dec_unlocked) or x["waste"].lower() in dec_unlocked]
+        if _show:
+            st.markdown("**What's happening in the wastes you can act on now:**")
+            for x in _show:
+                st.markdown(f"{RAG[x['flag']]} **{x['waste']}** — {x['detail']}  "
+                            f"*→ fix in the decision: {x['concept']}.*")
+
+        # PERFORMANCE: this used to be st.tabs(...), and Streamlit executes the body
+        # of EVERY tab on EVERY rerun — five views' worth of figures and charts each
+        # time a student clicked anything, whether or not they ever opened the panel.
+        # A radio renders only the view actually chosen, so a click costs one view.
+        with st.expander("📂 More detail — pick a view (5S, charts, costs, progress)"):
+            _VIEWS = ["🧹 5S detail", "👀 Problem visuals", "📊 Variability",
+                      "💵 Costs & ROI", "📈 Progress"]
+            _view = st.radio("Detail view", _VIEWS, horizontal=True,
+                             key="detail_view", label_visibility="collapsed")
+            if _view == _VIEWS[0]:
+                for name, done, decision, doing in five_s_status(cfg_done):
+                    st.markdown(f"{'✅' if done else '⬜'} **{name}** — {doing}  \n"
+                                f"&nbsp;&nbsp;&nbsp;*decision: {decision}*")
+            elif _view == _VIEWS[2]:
+                st.markdown("**Managing variability — the spread, not just the average.**")
+                show_cycle_hist(res.all_cycle_times)
+                reps = res.reps
+                worst = max(reps, key=lambda r: r["abandoned"] / max(1, r["arrivals"]))
+                best = min(reps, key=lambda r: r["abandoned"] / max(1, r["arrivals"]))
+                wpct = 100 * worst["abandoned"] / max(1, worst["arrivals"])
+                bpct = 100 * best["abandoned"] / max(1, best["arrivals"])
+                cvv = st.columns(3)
+                cvv[0].metric("Average cycle time", f"{res.avg_cycle:.0f}s")
+                cvv[1].metric("Spread (±1 SD)", f"± {res.avg_cycle_sd:.0f}s")
+                cvv[2].metric("Worst 'bad day'", f"{wpct:.0f}% left",
+                              f"vs {bpct:.0f}% best day", delta_color="off")
+                st.info("Raising **standard work** makes each drink a more consistent "
+                        "time — the histogram narrows and the gap between good and bad "
+                        "days shrinks. Predictability is itself a lean win.")
+            elif _view == _VIEWS[1]:
+                order_done = cfg_layout_order(cfg_done)
+                st.caption("🕒 Shows the shop **as you ran it this round**; your pending "
+                           "edits apply next rush.")
+                st.markdown("**How your drink flowed**")
+                show_flow(order_done)
+                st.markdown("**Where inventory piled up** — 🔵 prep · 🟠 WIP · 🔴 made-"
+                            "ahead · dots = customers waiting.")
+                show_inventory_map(order_done, res, cfg_done)
+                v1, v2 = st.columns(2)
+                tl = res.timeline
+                with v1:
+                    st.markdown("**Congestion through the rush**")
+                    wdf = pd.DataFrame({"in shop": tl["wip"]},
+                                       index=[round(x, 1) for x in tl["min"]])
+                    wdf.index.name = "minute"; st.line_chart(wdf)
+                with v2:
+                    st.markdown("**Served vs arrived vs lost**")
+                    fdf = pd.DataFrame({"arrived": tl["arrived"], "served": tl["served"],
+                                        "walked out": tl["walked_out"]},
+                                       index=[round(x, 1) for x in tl["min"]])
+                    fdf.index.name = "minute"; st.line_chart(fdf)
+            elif _view == _VIEWS[3]:
+                base = baseline_ref(cfg_done.demand_level)
+                dprofit = res.profit - base.profit
+                st.caption(f"Lean upkeep costs **${res.upkeep:.0f}/rush**.")
+                cc = st.columns(3)
+                cc[0].metric("Profit now", f"${res.profit:.0f}")
+                cc[1].metric("Messy-shop profit", f"${base.profit:.0f}")
+                cc[2].metric("Your improvement", f"${dprofit:+.0f}")
+                cb = pd.DataFrame({"$": res.cost_breakdown}).sort_values("$", ascending=False)
+                st.bar_chart(cb, horizontal=True)
+                st.caption(f"Revenue \\${res.revenue:.0f} − Cost \\${res.total_cost:.0f} "
+                           f"= Profit \\${res.profit:.0f}")
+            elif _view == _VIEWS[4]:
+                if len(hist) >= 2:
+                    h = pd.DataFrame(hist).set_index("round")
+                    kk = st.columns(2)
+                    kk[0].markdown("Lean Score ⬆"); kk[0].line_chart(h[["lean_score"]])
+                    kk[1].markdown("Profit $ ⬆"); kk[1].line_chart(h[["profit"]])
+                    tbl = h[["lean_score", "avg_cycle", "served", "defects", "waste",
+                             "abandon_pct", "upkeep", "profit"]].round(1)
+                    tbl.columns = ["Lean", "Cycle", "Served", "Wrong", "Waste",
+                                   "Lost%", "Upkeep", "Profit"]
+                    st.dataframe(tbl, use_container_width=True)
+                else:
+                    st.info("Play another round to see your trend.")
+
+        # ---------- ACT (Coaching Kata) ----------
+        st.markdown("<div id='jr-act'></div>", unsafe_allow_html=True)
+        _lastr = st.session_state.history[-1]["round"]
+        if _lastr not in st.session_state.coach_q:
+            _q = dict(coach_mc(_cfgd, _res, _diag, dec_unlocked,
+                               st.session_state.asked_coach))
+            # shuffle the answer order so the correct choice isn't always first
+            _pairs = list(enumerate(_q["options"]))
+            _random.Random(_lastr * 7 + 3).shuffle(_pairs)
+            _q["options"] = [t for _, t in _pairs]
+            _q["best"] = next(i for i, (oi, _) in enumerate(_pairs) if oi == _q["best"])
+            st.session_state.coach_q[_lastr] = _q
+            st.session_state.asked_coach.add(_q["id"])
+        _cq = st.session_state.coach_q[_lastr]
+        # open the decision expander for the waste the coach is pointing at
+        _coach_target = _cq.get("target_waste")
+        if _coach_target and _coach_target != "any":
+            _focus = _focus | {_coach_target}
+        _ckey2 = f"coachmc_{_lastr}"
+        _answered = _ans(_ckey2) is not None
+        with st.container(border=True):
+            st.markdown(f"### 🥋 ACT — Coaching Kata (Round {_lastr})")
+            st.caption("**Act** on what CHECK just showed: the five questions a lean "
+                       "coach asks to turn results into your next experiment. Answer #3 "
+                       "to unlock the **DO** button in the **sidebar**.")
+            st.markdown("**1. Target condition** — where you're headed:  \n"
+                        "*A lean, profitable shop — serve nearly everyone, few wrong "
+                        "drinks, little waste: a high Lean Score with healthy profit.*")
+            st.markdown(f"**2. Actual condition now** — the facts this rush:  \n"
+                        f"*Lean Score {_res.lean_score:.0f}/100 · served "
+                        f"{_res.served:.0f}/{_res.arrivals:.0f} · {_res.defects:.0f} wrong "
+                        f"· {_res.waste:.0f} wasted · {_res.abandon_pct:.0f}% walked out.*")
+            st.markdown(
+                f"""<div id='jr-coachq' class='jr-ask{' done' if _answered else ''}'>
+      <div class='jr-ask-tag'>{'✅ Answered — step 1 complete'
+                               if _answered
+                               else 'Required · this unlocks the DO button'}</div>
+      <div class='jr-ask-h'>3. What obstacle is most in your way?</div>
+      <div class='jr-ask-q'>{_mini_md(_cq['q'])}</div>
+      <div class='jr-ask-hint'>{'You can change your answer below at any time.'
+                                if _answered
+                                else '👇 Pick one of the options below — the ▶️ DO '
+                                     'button in the sidebar stays locked until you do.'}
+      </div>
+    </div>""", unsafe_allow_html=True)
+            _choice = st.radio("Your answer:", _cq["options"], index=None,
+                               key=_bind(_ckey2, _cq["options"]),
+                               label_visibility="collapsed")
+            _keep(_ckey2)
+            if _choice is None:
+                st.caption("🔒 The **DO** button (sidebar) stays locked until you "
+                           "choose — commit to a diagnosis first.")
+            else:
+                _pk = _cq["options"].index(_choice)
+                if _pk == _cq["best"]:
+                    st.success("✅ Good read of the obstacle — now decide your next "
+                               "experiment in **PLAN** below and run it.")
+                else:
+                    st.warning("That may not be the leanest read — think about which "
+                               "waste is hurting your score most, then plan a change.")
+                # the coach does NOT hand over the specific fix unless asked
+                _hkey = f"helped_{_lastr}"
+                if st.button("💡 Request additional help (reveal the next logical step)",
+                             key=f"helpbtn_{_lastr}"):
+                    st.session_state.answers[_hkey] = True
+                if _ans(_hkey):
+                    st.markdown("🧑‍🏫 " + _cq["guidance"])
+                    st.markdown(f"🔎 **Go and see:** {_cq['look']}.")
+                    st.markdown(f"🎯 **Suggested next step:** {_cq['focus']}.")
+                else:
+                    st.caption("Try to work out the next step yourself first. Stuck? "
+                               "Click **Request additional help** above.")
+
+
+    # ==========================================================================
+    # DESIGN
+    # ==========================================================================
+    def layout_editor():
+        st.caption("**Drag the stations into the order a drink is made.** The image "
+                   "below numbers each step ①–⑥ and draws the flow: 🟢 forward arrows "
+                   "are good, 🔴 backward arrows are wasted walking. Aim for all green.")
+        b1, b2 = st.columns(2)
+        if b1.button("↩︎ Reset to today's messy order", use_container_width=True):
+            C["order"] = list(SC["order"]); st.session_state.order_nonce += 1; st.rerun()
+        if b2.button("✨ Auto: perfect flow", use_container_width=True):
+            C["order"] = list(IDEAL_ORDER); st.session_state.order_nonce += 1; st.rerun()
+
+        if HAVE_DND:
+            try:
+                labels = [f"{STATION_EMOJI[s]}  {s}" for s in C["order"]]
+                back = {f"{STATION_EMOJI[s]}  {s}": s for s in C["order"]}
+                res = sort_items(labels, direction="horizontal",
+                                 key=f"order_dnd_{st.session_state.order_nonce}")
+                new = [back[x] for x in res]
+                if new != C["order"]:
+                    C["order"] = new
+                    st.rerun()
+            except Exception:
+                _button_reorder()
+        else:
+            _button_reorder()
+
+        show_flow(C["order"])
+        bt = backtracks(C["order"])
+        legend = ("🟢 every arrow points forward — clean flow!" if bt == 0
+                  else f"🔴 {bt} backward arrow(s) = the drink doubles back = wasted "
+                       "walking. Reorder to remove them.")
+        st.caption(f"Walking per drink: **{order_distance(C['order'])} steps**. {legend}")
+
+
+    def _button_reorder():
+        st.caption("Use ◀ ▶ to move a station along the counter:")
+        cols = st.columns(len(C["order"]))
+        for i, s in enumerate(C["order"]):
+            with cols[i]:
+                st.markdown(f"<div style='text-align:center'>{STATION_EMOJI[s]}<br>"
+                            f"<b>{STATION_ABBR[s]}</b></div>", unsafe_allow_html=True)
+                bl, br = st.columns(2)
+                if bl.button("◀", key=f"l{i}", disabled=(i == 0),
+                             use_container_width=True):
+                    C["order"][i - 1], C["order"][i] = C["order"][i], C["order"][i - 1]
+                    st.rerun()
+                if br.button("▶", key=f"r{i}", disabled=(i == len(C["order"]) - 1),
+                             use_container_width=True):
+                    C["order"][i + 1], C["order"][i] = C["order"][i], C["order"][i + 1]
+                    st.rerun()
+
+
+    def _dec(key, title, five_s_tag, cost_txt):
+        _new = key in _new_this_round
+        # newly unlocked decisions are flagged 🆕 and opened so students notice them
+        exp = _new or key in _focus or (not guided)
+        _badge = "🆕 NEW · " if _new else ""
+        return st.expander(f"{_badge}{title}   ·   {five_s_tag}   ·   💲 {cost_txt}",
+                           expanded=exp)
+
+
+    st.markdown("<div id='jr-plan'></div>", unsafe_allow_html=True)
+    st.markdown("### 🛠️ PLAN — make your decisions (one per waste)")
+    st.caption("Each of the **7 wastes** has a counter-measure. Notice **five of them "
+               "are exactly the 5 S's**; the last two (Defects, Waiting) need quality "
+               "tools and capacity. Cost per rush is shown on each.")
+
+    # Call out decisions that just unlocked this round (flagged 🆕 and opened below).
+    if _new_this_round:
+        _NAMES = {"overproduction": "Overproduction", "transport": "Transport",
+                  "motion": "Motion", "overprocessing": "Overprocessing",
+                  "inventory": "Inventory", "defects": "Defects", "waiting": "Waiting"}
+        _new_labels = [_NAMES[w] for w in WASTE_KEYS if w in _new_this_round]
+        st.success("🆕 **New this round:** " + ", ".join(_new_labels)
+                   + " — the 🆕 decisions below just unlocked.")
+
+    # The coach's directive shows here ONLY if the student requested help at the top.
+    _lr = st.session_state.history[-1]["round"] if st.session_state.history else None
+    _cq_prev = st.session_state.coach_q.get(_lr) if _lr else None
+    if _cq_prev and _ans(f"helped_{_lr}"):
+        st.info(f"🎯 **Coach's suggested focus:** {_cq_prev['focus']}.  "
+                f"🔎 First look at **{_cq_prev['look']}**.")
+
+    if not dec_unlocked:
+        st.info("Round 1 is your baseline — just press the flashing **RUN** button in "
+                "the **sidebar** (top-left). Decisions unlock next round.")
+
+    with st.container():
+        # 1. Overproduction  →  5S #1 Sort
+        if "overproduction" in dec_unlocked:
+            with _dec("overproduction", "🏭 **Overproduction** — making drinks before "
+                      "they're ordered", "5S #1 Sort", "free"):
+                st.caption("**Sort: keep only what's needed.** Made-ahead drinks go "
+                           "stale (wrong orders) or get binned (waste). One-piece flow "
+                           "= make each drink only when ordered.")
+                C["batch"] = st.number_input("Blend batch size (drinks per cycle)", 1, 6,
+                                             C["batch"], help="1 = one at a time.")
+                C["premade"] = st.number_input("Pre-made drinks staged at open", 0, 20,
+                                               C["premade"])
+
+        # 2. Transport  →  5S #2 Set in order
+        if "transport" in dec_unlocked:
+            _tbase = 1.0 if order_distance(C["order"]) < order_distance(list(SC["order"])) else 0.0
+            _tsum = _tbase + (sim.LEAN_COSTS["conveyor"] if C.get("conveyor") else 0.0)
+            tcost = f"${_tsum:.0f}/rush" if _tsum else "free"
+            with _dec("transport", "🚚 **Transport** — drinks carried around the shop",
+                      "5S #2 Set in order", tcost):
+                layout_editor()
+                st.divider()
+                C["conveyor"] = st.toggle(
+                    f"🛝 Conveyor belt between stations (${sim.LEAN_COSTS['conveyor']:.0f}"
+                    "/rush)", value=bool(C.get("conveyor")))
+                st.caption("The equipment rep says a belt moves drinks between stations "
+                           "so nobody has to carry them — it cuts walking time by about "
+                           "45%, whatever order the stations are in.")
+
+        # 3. Motion  →  5S #3 Shine
+        if "motion" in dec_unlocked:
+            fcost = sim.FIVE_S_COST.get(C["five_s"], 0.0)
+            with _dec("motion", "🚶 **Motion** — workers hunting for tools & "
+                      "ingredients", "5S #3 Shine", f"${fcost:.0f}/rush"):
+                st.caption("**Shine: clean & label.** A tidy, labeled station means no "
+                           "searching. Higher levels cost more upkeep — decide how far "
+                           "up the ladder is worth paying for.")
+                _fs = list(sim.FIVE_S_ORDER)
+                C["five_s"] = st.selectbox(
+                    "Clean & label level", _fs, index=_fs.index(C["five_s"]),
+                    label_visibility="collapsed")
+                fcost = sim.FIVE_S_COST.get(C["five_s"], 0.0)
+                st.caption(f"**{C['five_s']}** — {sim.FIVE_S_DESC[C['five_s']]}  ·  "
+                           f"**${fcost:.0f}/rush**.")
+
+        # 4. Overprocessing  →  5S #4 Standardize
+        if "overprocessing" in dec_unlocked:
+            sl = sim.STANDARD_LEVELS[C["standard_level"]]
+            with _dec("overprocessing", "🔧 **Overprocessing** — every drink made a "
+                      "different, longer way", "5S #4 Standardize", f"${sl['cost']:.0f}/rush"):
+                st.caption("**Standardize: one agreed best method.** Cheaper tiers give "
+                           "most of the benefit; the top tier costs a lot for little "
+                           "extra.")
+                snames = [f"{i}. {l['name']}" for i, l in enumerate(sim.STANDARD_LEVELS)]
+                spick = st.selectbox("Standard work level", snames,
+                                     index=C["standard_level"],
+                                     label_visibility="collapsed")
+                C["standard_level"] = snames.index(spick)
+                sl = sim.STANDARD_LEVELS[C["standard_level"]]
+                st.caption(f"**{sl['name']}** — {sl['desc']}  ·  ${sl['cost']:.0f}/rush.")
+
+        # 5. Inventory  →  5S #5 Sustain
+        if "inventory" in dec_unlocked:
+            _isum = ((3 if C["pull"] else 0) + (1 if C["fifo"] else 0)
+                     + (sim.LEAN_COSTS["safety_stock"] if C.get("safety_stock") else 0))
+            icost = f"${_isum:.0f}/rush" if _isum else "free"
+            with _dec("inventory", "📦 **Inventory** — stock sitting around going stale",
+                      "5S #5 Sustain", icost):
+                st.caption("Three ways to control inventory: **(a) one-piece flow** "
+                           "(batch 1, no pre-made) — free, keeps stock low; **(b) FIFO "
+                           "rotation** ($1/rush) — a use-oldest-first rule that keeps "
+                           "whatever stock you hold *fresh*, so far less spoils; "
+                           "**(c) pull replenishment** ($3/rush) — kanban that restocks "
+                           "only what's used. Start with (a); add (b) or (c) only if "
+                           "stock is still a problem — don't pay for what you don't need.")
+                C["fifo"] = st.toggle("FIFO rotation (use oldest stock first)",
+                                      value=C["fifo"])
+                C["pull"] = st.toggle("Pull replenishment (kanban)", value=C["pull"])
+                C["safety_stock"] = st.toggle(
+                    f"Safety stock — order extra of everything, just in case "
+                    f"(${sim.LEAN_COSTS['safety_stock']:.0f}/rush)",
+                    value=bool(C.get("safety_stock")))
+                st.caption("Your supplier offers a standing top-up order so you never "
+                           "run short of fruit mid-rush.")
+
+        # 6. Defects  →  quality tools (visual signals)
+        if "defects" in dec_unlocked:
+            vl = sim.VISUAL_LEVELS[C["visual_level"]]
+            with _dec("defects", "❌ **Defects** — wrong drinks that must be remade",
+                      "Quality tool: visual signals", f"${vl['cost']:.0f}/rush"):
+                st.caption("Make orders **visible** so they aren't mixed up. (Standard "
+                           "recipes above also cut defects.) Cheaper tiers give most of "
+                           "the benefit.")
+                vnames = [f"{i}. {l['name']}" for i, l in enumerate(sim.VISUAL_LEVELS)]
+                vpick = st.selectbox("Visual signal level", vnames,
+                                     index=C["visual_level"],
+                                     label_visibility="collapsed")
+                C["visual_level"] = vnames.index(vpick)
+                vl = sim.VISUAL_LEVELS[C["visual_level"]]
+                st.caption(f"**{vl['name']}** — {vl['desc']}  ·  ${vl['cost']:.0f}/rush.")
+
+        # 7. Waiting  →  capacity at the bottleneck
+        if "waiting" in dec_unlocked:
+            wage = sim.COSTS["employee_per_min"] * sim.HORIZON_S / 60.0
+            wcost = C["employees"] * wage + C["blenders"] * sim.COSTS["blender_per_rush"]
+            with _dec("waiting", "⏳ **Waiting** — customers & orders stuck in a queue",
+                      "Capacity at the bottleneck", f"${wcost:.0f}/rush"):
+                st.caption("Add people/equipment **only at the station that's backed "
+                           "up** — capacity costs money every rush. Test it first!")
+                C["mode"] = st.radio("Staffing model",
+                                     ["Whole-order", "Specialized stations"],
+                                     index=0 if C["mode"] == "Whole-order" else 1)
+                if C["mode"] == "Whole-order":
+                    C["employees"] = st.number_input("Baristas", 1, 6, C["employees"])
+                else:
+                    scg = st.columns(3)
+                    C["spec_prep"] = scg[0].number_input("Prep", 0, 5, C["spec_prep"])
+                    C["spec_blend"] = scg[1].number_input("Blend", 0, 5, C["spec_blend"])
+                    C["spec_finish"] = scg[2].number_input("Finish", 0, 5, C["spec_finish"])
+                    C["employees"] = max(1, C["spec_prep"] + C["spec_blend"]
+                                         + C["spec_finish"])
+                    st.caption(f"Total baristas: **{C['employees']}**")
+                C["blenders"] = st.number_input("🌀 Blenders ($12/rush each)", 1, 4,
+                                                C["blenders"])
+                st.caption(f"The bar comfortably fits **{sim.CROWD_FREE_STAFF} people**; "
+                           "past that they work around each other and every task takes "
+                           "a little longer.")
+
+        # ---- The rep's catalogue: paid extras that are NOT lean counter-measures ----
+        if dec_unlocked:
+            _buy_on = [nm for f, nm in EXTRA_BUYS
+                       if C.get(f) and f not in ("conveyor", "safety_stock")]
+            _shelf_cost = sum(
+                (sim.UPGRADE_COSTS.get(f, 0.0) if f != "premium_ingredients"
+                 else sim.COSTS["premium_extra_per_drink"] * 40)
+                for f, _ in EXTRA_BUYS if C.get(f) and f in
+                ("promo_push", "robo_juicer", "staging_fridge", "signage",
+                 "premium_ingredients"))
+            with st.expander(
+                    "🛒 **Tempting upgrades** — the sales rep is in the shop again"
+                    + (f"   ·   💲 ${_shelf_cost:.0f}/rush committed" if _buy_on
+                       else "   ·   💲 nothing bought"),
+                    expanded=False):
+                st.caption("None of these is a lean counter-measure — they're things "
+                           "a shop *can* buy. Each shows its real price. Whether any of "
+                           "them earns that money back in **your** shop is exactly the "
+                           "judgement the last objective is testing. Use **Test the "
+                           "profit impact** below before you commit.")
+                for _f, _label, _price, _pitch in UPGRADE_SHELF:
+                    C[_f] = st.toggle(f"{_label}  ·  {_price}", value=C.get(_f, False),
+                                      key=f"buy_{_f}")
+                    st.caption(_pitch)
+
+        # always show the workflow picture + the derived 5S board so the two
+        # frameworks stay front-and-center
+        if "transport" not in dec_unlocked:
+            st.caption(f"Current drink path: {order_distance(C['order'])} steps.")
+            show_flow(C["order"])
+        if dec_unlocked:
+            st.markdown("**Your 5S progress** (the five S's are five of the seven "
+                        "waste fixes above):")
+            render_5s(cfg_from_state(C))
+
+    cfg = cfg_from_state(C)
+
+    # ---- PLAN · rehearse + profitability + commit (kept together with decisions) ----
+    if st.session_state.last_result is not None and dec_unlocked:
+        _resL = st.session_state.last_result
+        _cfgL = st.session_state.last_cfg
+        with st.container(border=True):
+            st.markdown("### 📝 PLAN · rehearse — preview the profit of your options")
+            st.caption("Your decisions above are the only place changes are made — this "
+                       "just previews them. Nothing here commits or advances the round.")
+
+            def _plan_sig(c):
+                return _spend_sig(c)
+
+            # ---- dry-run: auto-computed whenever the plan changes (cached) ----
+            chg = plan_changes(_cfgL, cfg)
+            if chg:
+                st.markdown("**Your plan changes vs the last rush:** " + "; ".join(chg))
+                sig = _plan_sig(cfg)
+                cache = st.session_state.get("dryrun_cache")
+                if not cache or cache[0] != sig:
+                    with st.spinner("Previewing your plan…"):
+                        _bd = run_sim(_clone(_cfgL), base_seed=ANALYSIS_SEED)
+                        _pd = run_sim(_clone(cfg), base_seed=ANALYSIS_SEED)
+                    cache = (sig, dict(name="; ".join(chg)[:90], added_cost=0,
+                                       d_profit=_pd.profit - _bd.profit,
+                                       d_score=_pd.lean_score - _bd.lean_score,
+                                       d_served=_pd.served - _bd.served))
+                    st.session_state.dryrun_cache = cache
+                    st.session_state.tested = [c for c in st.session_state.tested
+                                               if c.get("added_cost") != 0] + [cache[1]]
+                _t = cache[1]
+                good = _t["d_profit"]
+                st.markdown(f"**Dry-run preview:** profit **{good:+.0f}\\$**, served "
+                            f"{_t['d_served']:+.0f}, Lean **{_t['d_score']:+.0f}** "
+                            "*vs the last rush.*")
+                if good > 3:
+                    st.success("👍 Looks worth it — commit your plan below.")
+                elif good >= -1:
+                    st.info("😐 Barely moves profit — is it aimed at the coach's obstacle?")
+                else:
+                    st.warning("👎 Profit would drop — a change may cost more than it "
+                               "returns. Adjust a decision above.")
+            else:
+                st.caption("No changes yet — adjust a decision above (the coach said "
+                           "where to look) and this will preview its effect automatically.")
+
+            # ---- profitability test — re-run anytime, tests your CURRENT plan ----
+            with st.expander("🔬 Test the profit impact of each change *(optional)*",
+                             expanded=False):
+                st.caption("Tests the levers **unlocked this round** against your "
+                           "**current plan** — change a decision and run it again to "
+                           "re-test.")
+                if st.button("🔬 Run / re-run the test", key=f"roibtn_{rnd}"):
+                    with st.spinner("Testing each available change…"):
+                        _opts = next_step_options(cfg, allowed=dec_unlocked)
+                        st.session_state["roirows"] = (
+                            _plan_sig(cfg),
+                            [test_one_option(cfg, o) for o in _opts])
+                _cache = st.session_state.get("roirows")
+                _rows = _cache[1] if _cache else None
+                if _rows and _cache[0] == _plan_sig(cfg):
+                    for r in sorted(_rows, key=lambda x: -x["d_profit"]):
+                        st.markdown(f"• **{r['name']}** — cost **\\${r['added_cost']:.0f}"
+                                    f"/rush** → profit **{r['d_profit']:+.0f}\\$**, "
+                                    f"served **{r['d_served']:+.0f}**, Lean "
+                                    f"**{r['d_score']:+.0f}**")
+                    show_impact_effort(_rows)
+                elif _rows:
+                    st.info("Your plan changed since the last test — click **Run / "
+                            "re-run the test** to refresh.")
+                else:
+                    st.caption("Click **Run / re-run the test** to see the profit impact "
+                               "of each available change on your current plan.")
+
+        # ---- REQUIRED: commit your plan before you can DO ----
+        with st.container(border=True):
+            st.markdown("### 🎯 PLAN · commit — lock in your experiment *(required)*")
+            st.markdown("Before you run: **what do you predict your plan will do this "
+                        "round?** (Toyota Kata step 4–5: name your experiment & your "
+                        "prediction.)")
+            _pk_opts = [
+                "It will improve BOTH my Lean Score and profit",
+                "It will improve the Lean Score, even if profit dips",
+                "It's an experiment — it might backfire (and that's OK to learn)",
+                "I'm re-running the same plan to confirm the result"]
+            _pc = st.radio("Your prediction:", _pk_opts, index=None,
+                           key=_bind(f"plancommit_{rnd}", _pk_opts),
+                           label_visibility="collapsed")
+            _keep(f"plancommit_{rnd}")
+            if _pc is None:
+                st.caption("🔒 Commit a prediction to unlock the **DO** button.")
+            else:
+                st.success("Locked in — press ▶️ **DO** in the sidebar. Next round's "
+                           "CHECK will tell you if you were right.")
+
+    st.markdown("<div id='jr-do'></div>", unsafe_allow_html=True)
+    if need_coach:
+        st.warning("✍️ **Answer the coach's question at the top** to unlock the DO "
+                   "button — diagnosing before acting is the whole skill.")
+        _wj, _ = st.columns([1, 2])
+        with _wj:
+            jr_jump_button("⬆️ Take me to the coach's question")
+
+
+    # ==========================================================================
+    # run + results
+    # ==========================================================================
+    def summarize(res, cfg):
+        # capture the student's decisions this round too, for the LMS report
+        decisions = []
+        if backtracks(cfg_layout_order(cfg)) == 0:
+            decisions.append("ordered flow")
+        if cfg.five_s != "Disorganized":
+            decisions.append(f"5S:{cfg.five_s}")
+        if cfg.standard_level > 0:
+            decisions.append(f"std:{sim.STANDARD_LEVELS[cfg.standard_level]['name']}")
+        if cfg.visual_level > 0:
+            decisions.append(f"visual:{sim.VISUAL_LEVELS[cfg.visual_level]['name']}")
+        if cfg.pull_replenishment:
+            decisions.append("pull")
+        if cfg.fifo_rotation:
+            decisions.append("fifo")
+        if cfg.batch_size > 1:
+            decisions.append(f"batch×{cfg.batch_size}")
+        if cfg.premade > 0:
+            decisions.append(f"premade×{cfg.premade}")
+        decisions.append(f"{cfg.employees} staff/{cfg.blenders} blndr")
+        decisions += [nm for f, nm in EXTRA_BUYS if getattr(cfg, f)]
+        return dict(round=st.session_state.round, lean_score=res.lean_score,
+                    avg_cycle=res.avg_cycle, served=res.served,
+                    arrivals=res.arrivals, defects=res.defects, waste=res.waste,
+                    abandon_pct=res.abandon_pct, avg_wip=res.avg_wip,
+                    walk_units=res.walk_units, profit=res.profit, upkeep=res.upkeep,
+                    decisions=", ".join(decisions))
+
+
+    if run:
+        with st.spinner("Simulating the rush…"):
+            res = run_sim(cfg, base_seed=1000 + rnd)
+        st.session_state.last_result = res
+        st.session_state.last_cfg = copy.deepcopy(cfg)
+        # JSON-able snapshot of exactly what was run + its seed, so a resumed session
+        # can rebuild last_result deterministically (see the rebuild block below).
+        st.session_state.last_cdict = copy.deepcopy(C)
+        st.session_state.last_seed = 1000 + rnd
+        _entry = summarize(res, cfg)
+        # each round keeps its own decisions + seed, so any past round can be
+        # re-shown exactly (Past rounds page) or rewound to
+        _entry["cdict"] = copy.deepcopy(C)
+        _entry["seed"] = 1000 + rnd
+        _entry["all_ok"] = objectives_status(cfg, res)["all_ok"]
+        st.session_state.history.append(_entry)
+        if _entry["all_ok"] and not st.session_state.get("goal_reached_once"):
+            st.session_state.goal_reached_once = True
+            st.session_state.just_completed = True     # one-time celebration
+            # completion record for the Director (no-op when storage is off). There
+            # is no completion code: what the student submits is the PDF report.
+            if not st.session_state.get("_completion_recorded"):
+                try:
+                    store.record_completion(game, sid, score=round(res.profit, 1))
+                    st.session_state["_completion_recorded"] = True
+                except Exception:
+                    pass
+        st.session_state.round += 1
+        st.session_state.tested = []
+        st.session_state.staged = []
+        st.session_state.scroll_top = True     # jump to top so results are seen first
+        _autosave()                            # persist the finished rush / new round
+        st.rerun()
+
+    render_page_footer()
+
+elif st.session_state.page == "rounds":
+    render_rounds_page()
+elif st.session_state.page == "debrief":
+    render_debrief_page()
+else:
+    render_report_page()
 
 
 # ==========================================================================

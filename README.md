@@ -119,10 +119,33 @@ scenario, so the goal is always achievable.
 
 ---
 
+## Pages and going back
+
+The app has four pages, switched with the buttons at the top of the screen:
+
+- **🏪 Simulation** — the CHECK → ACT → PLAN → DO loop for the current round.
+- **🕘 Past rounds** — every rush played so far. Open any round to see its
+  results, the full set of decisions behind it, the prediction made for it and
+  the coach answer that followed, plus its charts. From there a student can
+  **copy that round's decisions into the current plan** (nothing is deleted) or
+  **rewind** the game to just after that round (later rounds and their answers
+  are removed after a confirmation tick-box).
+- **🎓 Debrief** — locked until one rush meets all the objectives; holds the
+  synthesis, the written reflections, the knowledge check and the ROI reveal.
+- **📄 Report** — what is still outstanding, and the PDF (also available from
+  *Report & progress* in the sidebar).
+
+Every answer (coach diagnoses, plan predictions, reflections, knowledge check) is
+kept when switching pages, and — with per-student storage configured — survives
+closing the tab and logging back in. The student also returns to the page they
+were on. Progress saved by earlier versions is migrated automatically.
+
+---
+
 ## The debrief and assessment
 
 Most of the learning in a simulation happens in the debrief, so the game gates on
-it. Once the objectives are met, students get:
+it. Once the objectives are met, the **Debrief** page opens with:
 
 - a **per-waste table** — what they did to each of the seven, the tool, the result;
 - a written **"your lean journey"** narrative and whole-arc charts;
@@ -131,15 +154,18 @@ it. Once the objectives are met, students get:
 - the **lean priority ladder** — the general rule their game just demonstrated;
 - **four written reflections** (biggest lever, what wasn't worth it, prediction
   accuracy, and transfer to a real process);
-- a **five-question knowledge check** with instant feedback and a score.
+- a **seven-question knowledge check** with instant feedback and a score.
 
 **The PDF report can be downloaded at any time after the first round, and its
 first page says plainly whether it is COMPLETE or INCOMPLETE** — an incomplete one
 also lists exactly what is outstanding (objectives not yet met, reflections or
 knowledge-check questions unanswered, no name entered) and is tagged in the page
 footer and the file name. It is a clean, auto-paginating, multi-page document —
-title page with KPI cards, a round-by-round table, decisions per round, and every
-recorded answer — ready to submit to an LMS.
+KPI cards, the objectives, a round-by-round results table and trend charts, a
+**round journal** (decisions → prediction → coach diagnosis, once per round), the
+reflections and the scored knowledge check. Each fact appears once; text is
+wrapped to the true font width, long tables continue on the next page with their
+header repeated, and nothing can overlap — ready to submit to an LMS.
 
 ---
 
@@ -162,8 +188,6 @@ recorded answer — ready to submit to an LMS.
   pause and resume, hand out **signed-in `?game=…&sid=…` links** with storage
   configured (see *Per-student progress and resume* above) — the app then saves
   and restores automatically and shows a "Signed in / progress saved" note.
-- **Two modes.** *Guided* walks through the wastes and opens one decision at a
-  time (the coach's highest-payoff pick); *Free play* unlocks every control.
 - **Scenario settings** (demand, replications) can be overridden in the sidebar.
 - Class discussion prompts that work well: *Why did your best first move differ
   from your neighbour's? Which change did you keep that you shouldn't have?*
