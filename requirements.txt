@@ -1,7 +1,12 @@
-streamlit>=1.30
+# Pinned: Community Cloud installs the newest release on every reboot unless the
+# version is pinned (Streamlit's own advice). Streamlit 1.66+ needs Python 3.11+,
+# so the pin follows the Python version chosen in the app's Cloud settings.
+# Both versions pass the regression tests; 1.67.0 is the one load-tested.
+streamlit==1.67.0; python_version >= "3.11"
+streamlit==1.65.0; python_version < "3.11"
 pandas>=1.5
 matplotlib>=3.6
-streamlit-sortables>=0.3
+streamlit-sortables==0.3.1
 
 # Required for per-student persistence (student_store) once storage secrets are
 # configured. Harmless if storage is left unconfigured (imported lazily).
