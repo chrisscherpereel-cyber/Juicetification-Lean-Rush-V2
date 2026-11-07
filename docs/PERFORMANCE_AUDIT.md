@@ -99,7 +99,14 @@ reflected here. They are measured separately above.
 
 ### Run 2 — final version (all fixes, default server settings, 1 core)
 
-FINAL_RESULTS_PLACEHOLDER
+| users | mode | peak memory MB (before → after) | server CPU-s | median response s | p95 response s | errors |
+|---|---|---|---|---|---|---|
+| 30 | burst | 4345 → 504 | 145.8 → 117.1 (−20%) | 6.90 → 7.15 | 26.8 → 23.8 | 0/0 |
+| 30 | paced | 3021 → 426 | 133.7 → 107.3 (−20%) | 2.38 → 1.18 | 14.2 → 10.2 | 0/0 |
+
+Under "burst" the single core is saturated in both versions, so the median wait
+is set by queueing order. The gain shows up as less total CPU and a shorter
+tail. In the paced (realistic) case, the typical click is **twice as fast**.
 
 ## Can it support 30–40 students?
 
