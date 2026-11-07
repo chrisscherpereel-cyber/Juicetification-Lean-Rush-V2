@@ -961,22 +961,47 @@ def seven_wastes_diagnostic(cfg: Config, res: RoundResult) -> List[Dict]:
     ]
     return items
 
-import sys as _sys
-sim = _sys.modules[__name__]  # expose engine as `sim`
+class _EngineView:
+    """Expose the engine above as `sim` (sim.run_simulation, sim.ROUTE, ...).
+
+    CONCURRENCY: this used to be `sys.modules[__name__]`. Under Streamlit every
+    rerun of every session executes this file into a fresh module that it
+    installs as sys.modules["__main__"] -- one process-wide slot that 30
+    students' threads keep overwriting. A session could therefore bind `sim` to
+    ANOTHER student's half-executed module (missing names -> crash, or that
+    module's instructor overrides). Looking names up in this run's own globals
+    removes the race entirely."""
+    __slots__ = ("_g",)
+
+    def __init__(self, g):
+        object.__setattr__(self, "_g", g)
+
+    def __getattr__(self, name):
+        try:
+            return self._g[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+
+sim = _EngineView(globals())
 
 # ==========================================================================
 #  USER INTERFACE  (the engine above is exposed through the name `sim`)
 # ==========================================================================
 import copy
+import datetime as _datetime
 
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+# pyplot is deliberately NOT imported: its figure registry is global and not
+# thread-safe, and every concurrent session runs in its own thread. All figures
+# are built with the object API (matplotlib.figure.Figure) instead.
 from matplotlib.patches import FancyArrowPatch, FancyBboxPatch, Circle
 
 import streamlit as st
 import student_store as store   # per-student progress (safe no-op when unconfigured)
+import autosave_worker as _autosave_worker   # saves progress off the click path
 
 try:
     from streamlit_sortables import sort_items
@@ -1075,7 +1100,35 @@ from juice_director import serve_manifest_if_requested, resolve_config
 serve_manifest_if_requested(MANIFEST)
 # `?game=<code>` links pull the instructor's saved configuration straight from
 # storage (the same Dropbox the Director writes to); `?cfg=` still works too.
-CFG, CTX = resolve_config(MANIFEST, fetch=store.load_game_config)
+
+
+class _NoGameConfig(Exception):
+    """Raised inside the cached fetch so a miss/failure is never cached."""
+
+
+@st.cache_data(show_spinner=False, ttl=120, max_entries=64)
+def _game_config_cached(code):
+    payload = store.load_game_config(code)
+    if payload is None:
+        raise _NoGameConfig(code)
+    return payload
+
+
+def _fetch_game_config(code):
+    """PERFORMANCE: resolve_config() runs on EVERY rerun, and with a ?game= link
+    it used to download + decrypt the instructor's config from Dropbox each time
+    -- a network round trip added to every click by every student (and a fast
+    way to hit Dropbox's rate limit, whose back-off sleeps then stall the click).
+    The config is the same for everyone holding the same game code and is not
+    student data, so one process-wide copy is shared, refreshed every 2 minutes
+    so an instructor's edit still reaches the class. Failures are not cached."""
+    try:
+        return _game_config_cached(code)
+    except _NoGameConfig:
+        return None
+
+
+CFG, CTX = resolve_config(MANIFEST, fetch=_fetch_game_config)
 # apply the instructor's economics / rush overrides to the engine constants
 HORIZON_S = CFG["horizon_s"]
 BLEND_SETUP = CFG["blend_setup"]
@@ -1763,10 +1816,17 @@ def _answers_from_legacy(refl):
     return ans
 
 
+def _saver():
+    # process-wide worker pool (see autosave_worker.py)
+    return _autosave_worker.get_saver(
+        lambda key, snap: store.save(key[0], key[1], snap))
+
+
 def _autosave():
     """Persist the current snapshot, but only when it has actually changed, so a
     save happens on each meaningful step (answer, round, rush) and never on idle
-    reruns. A no-op when storage is unconfigured or no student is identified."""
+    reruns. A no-op when storage is unconfigured or no student is identified.
+    The upload itself runs in the background (see autosave_worker.py)."""
     if not (store.enabled() and sid):
         return
     snap = _progress_snapshot()
@@ -1774,7 +1834,7 @@ def _autosave():
     if sig == st.session_state.get("_last_saved_sig"):
         return
     try:
-        store.save(game, sid, snap)
+        _saver().submit((game, sid), snap)
         st.session_state["_last_saved_sig"] = sig
     except Exception:
         pass
@@ -1786,7 +1846,7 @@ def _clear_transient_state():
     _pfx = ("coachmc_", "plancommit_", "helped_", "dquiz_", "debrief_",
             "roibtn_", "order_dnd_", "buy_")
     _flags = {"dryrun_cache", "roirows", "goal_reached_once", "_rr_cache",
-              "report_pdf", "report_complete",
+              "report_pdf", "report_complete", "report_sig",
               "_completion_recorded", "_last_saved_sig", "last_cdict", "last_seed"}
     for k in list(st.session_state.keys()):
         if k in _flags or k.startswith(_pfx):
@@ -1797,7 +1857,8 @@ _init_state()
 # resume: overlay any saved progress exactly once per session, before the app
 # binds C/SC from session_state below.
 if store.enabled() and sid and not st.session_state.get("_restored"):
-    _saved = store.load(game, sid)
+    # a snapshot still queued for upload is newer than what Dropbox holds
+    _saved = _saver().latest((game, sid)) or store.load(game, sid)
     if _saved:
         _restore_progress(_saved)
     st.session_state["_restored"] = True
@@ -2019,7 +2080,7 @@ def _inventory_map_draw(order, prep, wip, pm, npk, stress):
     for j in range(min(pm, 10)):
         _cup(ax, xp, 0.42 + j * 0.19, "#e76f51")         # made-ahead (red) above
 
-    ccol = plt.cm.RdYlGn_r(0.15 + 0.7 * stress)
+    ccol = matplotlib.colormaps["RdYlGn_r"](0.15 + 0.7 * stress)
     for i in range(min(npk, 15)):
         ax.scatter([xp - 0.28 + (i % 3) * 0.28], [-0.55 - (i // 3) * 0.17],
                    s=60, color=ccol, edgecolors="#333", zorder=4)
@@ -2243,28 +2304,34 @@ def seven_waste_png(flags):
     return _to_png(seven_waste_fig([{"waste": w, "flag": f} for w, f in flags]))
 
 
+# PERFORMANCE: Streamlit hashes cache-key arguments element by element, which
+# is slow for long tuples (a rush has hundreds of cycle times; the sim key is a
+# nested tuple of ~40 settings). Every rerun hashes ~100 such keys, ~30% of an
+# ordinary click. Where the data is long, the key is passed ready-made as
+# `key = repr(data)` -- one string, hashed in one pass, exactly as unique as the
+# data -- and the data itself rides along un-hashed as an underscore argument.
 @st.cache_data(**_FIG_CACHE)
-def cycle_hist_png(cts, target=120):
-    return _to_png(cycle_hist(list(cts), target))
+def cycle_hist_png(key, _cts, target=120):
+    return _to_png(cycle_hist(list(_cts), target))
 
 
 @st.cache_data(**_FIG_CACHE)
-def impact_effort_png(rows):
+def impact_effort_png(key, _rows):
     return _to_png(impact_effort_chart(
-        [{"short": s, "added_cost": c, "d_profit": p} for s, c, p in rows]))
+        [{"short": s, "added_cost": c, "d_profit": p} for s, c, p in _rows]))
 
 
 @st.cache_data(**_FIG_CACHE)
-def value_time_png(rows):
+def value_time_png(key, _rows):
     return _to_png(value_time_fig(
-        [(lbl, dict(zip(sim.TIME_PARTS, vals))) for lbl, vals in rows]))
+        [(lbl, dict(zip(sim.TIME_PARTS, vals))) for lbl, vals in _rows]))
 
 
 def show_value_time(rows):
     """rows: [(label, time_split dict), ...]"""
-    show_png(value_time_png(tuple(
-        (lbl, tuple(round(ts.get(p, 0.0), 1) for p in sim.TIME_PARTS))
-        for lbl, ts in rows if ts)))
+    data = tuple((lbl, tuple(round(ts.get(p, 0.0), 1) for p in sim.TIME_PARTS))
+                 for lbl, ts in rows if ts)
+    show_png(value_time_png(repr(data), data))
 
 
 # ---- the call sites use these: same pictures, drawn at most once -----------
@@ -2289,13 +2356,14 @@ def show_seven_wastes(diag):
 
 
 def show_cycle_hist(cts, target=120):
-    show_png(cycle_hist_png(tuple(round(c, 1) for c in cts), target))
+    data = tuple(round(c, 1) for c in cts)
+    show_png(cycle_hist_png(repr(data), data, target))
 
 
 def show_impact_effort(rows):
-    show_png(impact_effort_png(
-        tuple((r["short"], round(r["added_cost"], 2), round(r["d_profit"], 2))
-              for r in rows)))
+    data = tuple((r["short"], round(r["added_cost"], 2), round(r["d_profit"], 2))
+                 for r in rows)
+    show_png(impact_effort_png(repr(data), data))
 
 
 # --------------------------------------------------------------------------
@@ -2322,18 +2390,33 @@ def cfg_signature(cfg):
 
 
 @st.cache_data(show_spinner=False, ttl=3600, max_entries=2048)
-def _sim_cached(sig, seed, _cfg):
+def _sim_cached(sig, seed, engine, _cfg):
     # `sig` IS the cache key and must NOT start with an underscore — Streamlit
     # excludes underscore-prefixed arguments from the key, which would collapse
     # every shop that shares a seed onto one cached result. `_cfg` is excluded
     # on purpose: it rides along to do the work without being hashed.
-    return sim.run_simulation(_cfg, base_seed=seed)
+    # `engine` carries the instructor's rush overrides (horizon, blend setup,
+    # handoff time). The cache is shared by the whole process, so two class
+    # sections running different ?game= settings at once must not be served
+    # each other's rushes.
+    # The result is cached as a plain dict, not a RoundResult: st.cache_data
+    # pickles it, and pickle finds the class via sys.modules["__main__"] --
+    # which, with 30 sessions rerunning, is usually ANOTHER session's module.
+    # Pickling a RoundResult then fails ("not the same object as
+    # __main__.RoundResult"), so under exactly the classroom load the cache was
+    # meant for, results silently stopped being stored and every rush was
+    # recomputed. A dict of plain values pickles the same in every session.
+    return dataclasses.asdict(sim.run_simulation(_cfg, base_seed=seed))
 
 
 def run_sim(cfg, base_seed=1234):
     """Cached stand-in for sim.run_simulation used everywhere in the UI."""
     try:
-        return _sim_cached(cfg_signature(cfg), base_seed, cfg)
+        # repr(): one string key instead of a nested tuple (see the note on
+        # cycle_hist_png -- same uniqueness, a fraction of the hashing cost)
+        return RoundResult(**_sim_cached(
+            repr(cfg_signature(cfg)), base_seed,
+            (HORIZON_S, BLEND_SETUP, HANDOFF_TIME), cfg))
     except Exception:
         return sim.run_simulation(cfg, base_seed=base_seed)
 
@@ -2478,7 +2561,7 @@ def _rewind_to(n):
                 ss.pop(k, None)
     ss.coach_q = {r: q for r, q in ss.coach_q.items() if r <= n}
     ss.goal_reached_once = any(x.get("all_ok") for x in ss.history)
-    for k in ("dryrun_cache", "roirows", "report_pdf", "report_complete"):
+    for k in ("dryrun_cache", "roirows", "report_pdf", "report_complete", "report_sig"):
         ss.pop(k, None)
     _drop_decision_widgets()
     _go("sim")
@@ -3230,6 +3313,35 @@ def _report_journal():
     return out
 
 
+def _report_signature():
+    """Everything the report is built from: the persisted progress, every plain
+    text/number value currently held (answers are also mirrored into the
+    progress), the name, and today's date. Booleans are skipped: they are button
+    click states (Generate, Download, navigation), which change on every click
+    without changing the report."""
+    ss = st.session_state
+    live = {k: ss[k] for k in list(ss.keys())
+            if isinstance(k, str) and not k.startswith(("_", "report_"))
+            and type(ss[k]) in (str, int, float, type(None))}
+    return json.dumps([_progress_snapshot(), _jsonable(live), sid,
+                       str(_datetime.date.today())],
+                      sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _generate_report(rs):
+    """Build the PDF on demand -- and only if something it shows has changed.
+    PERFORMANCE: a report is ~10x the CPU of a normal click, and students tend
+    to press Generate repeatedly; an identical rebuild is skipped."""
+    ss = st.session_state
+    sig = _report_signature()
+    if ss.get("report_pdf") and ss.get("report_sig") == sig:
+        return
+    with st.spinner("Building your PDF report…"):
+        ss["report_pdf"] = build_report_pdf()
+        ss["report_complete"] = rs["complete"]
+        ss["report_sig"] = sig
+
+
 def build_report_pdf():
     """A clean, auto-paginating multi-page PDF report (no external libraries).
 
@@ -3264,9 +3376,13 @@ def build_report_pdf():
     S = {"fig": None, "y": TOP, "page": 0}
     buf = _io.BytesIO()
     pdf = PdfPages(buf)
-    # measure at high resolution: low-dpi font hinting under-reports widths
+    # measure at high resolution: low-dpi font hinting under-reports widths.
+    # PERFORMANCE / MEMORY: text measurement only needs the DPI, never the pixel
+    # buffer. A full-page canvas at 720 dpi (6120 x 7920 px) allocated ~194 MB of
+    # RAM per report -- a few students generating at once could exhaust the
+    # container. A 1 x 1 renderer at the same DPI returns identical widths.
     _MDPI = 720
-    _meas = RendererAgg(int(PAGE_W * _MDPI), int(PAGE_H * _MDPI), _MDPI)
+    _meas = RendererAgg(1, 1, _MDPI)
     _glyphs = set(FT2Font(findfont(FontProperties(family="DejaVu Sans")))
                   .get_charmap())
 
@@ -3297,11 +3413,13 @@ def build_report_pdf():
         text(RIGHT, 0.039, f"Page {S['page']}", fontsize=7.5, color=LGREY,
              ha="right")
         pdf.savefig(f)
-        plt.close(f)
 
     def new_page():
         _finish_page()
-        f = plt.figure(figsize=(PAGE_W, PAGE_H))
+        # A standalone Figure, not plt.figure(): pyplot's figure registry is
+        # process-global and not thread-safe, and every student's script runs in
+        # its own thread of the same process.
+        f = _Figure(figsize=(PAGE_W, PAGE_H))
         f.patch.set_facecolor("white")
         S["fig"] = f
         S["page"] += 1
@@ -3325,11 +3443,22 @@ def build_report_pdf():
         if S["y"] - dy < BOT:
             new_page()
 
+    _props, _widths = {}, {}
+
     def _width(s, size, bold):
-        prop = FontProperties(family="DejaVu Sans", size=size,
-                              weight="bold" if bold else "normal")
-        return (_meas.get_text_width_height_descent(s, prop, ismath=False)[0]
-                * 72.0 / _MDPI)
+        # word-wrap measures the same words and line prefixes over and over:
+        # memoise per report (cheap dict, discarded with the report)
+        k = (s, size, bold)
+        w = _widths.get(k)
+        if w is None:
+            prop = _props.get((size, bold))
+            if prop is None:
+                prop = _props[(size, bold)] = FontProperties(
+                    family="DejaVu Sans", size=size,
+                    weight="bold" if bold else "normal")
+            w = _widths[k] = (_meas.get_text_width_height_descent(
+                s, prop, ismath=False)[0] * 72.0 / _MDPI)
+        return w
 
     def wrap(s, size, bold=False, indent=0.0):
         """Greedy word-wrap against the true rendered width (in points)."""
@@ -3723,9 +3852,7 @@ with st.sidebar:
         else:
             if st.button("📄 Generate report", use_container_width=True,
                          key="gen_report_side"):
-                with st.spinner("Building your PDF report…"):
-                    st.session_state["report_pdf"] = build_report_pdf()
-                    st.session_state["report_complete"] = _rs["complete"]
+                _generate_report(_rs)
             if st.session_state.get("report_pdf"):
                 _safe = (st.session_state.student or "student").replace(" ", "_")
                 _tag = "" if st.session_state.get("report_complete") else "_INCOMPLETE"
@@ -3734,7 +3861,8 @@ with st.sidebar:
                     data=st.session_state["report_pdf"],
                     file_name=f"juicetification_{_safe}_sc{SC['sid']}{_tag}.pdf",
                     mime="application/pdf", use_container_width=True,
-                    key="dl_report_side")
+                    key="dl_report_side",
+                    on_click="ignore")  # no full-app rerun just to download
                 st.caption("Generated just now. Click **Generate report** again "
                            "after you answer more, to refresh it.")
 
@@ -4277,9 +4405,7 @@ def render_report_page():
         # expensive than a normal click.
         if st.button("📄 Generate report", use_container_width=True,
                      type="primary", key="gen_report_main"):
-            with st.spinner("Building your PDF report…"):
-                ss["report_pdf"] = build_report_pdf()
-                ss["report_complete"] = rs["complete"]
+            _generate_report(rs)
         if ss.get("report_pdf"):
             st.download_button(
                 ("⬇️  Download PDF report" if ss.get("report_complete")
@@ -4287,7 +4413,8 @@ def render_report_page():
                 data=ss["report_pdf"],
                 file_name=f"juicetification_{safe}_sc{SC['sid']}{tag}.pdf",
                 mime="application/pdf", use_container_width=True,
-                key="dl_report_main")
+                key="dl_report_main",
+                on_click="ignore")  # no full-app rerun just to download
             st.caption("Generated just now. Click **Generate report** again after "
                        "you answer more, to refresh it.")
         else:
