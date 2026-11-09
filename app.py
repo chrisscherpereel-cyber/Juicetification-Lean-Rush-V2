@@ -1001,6 +1001,7 @@ from matplotlib.patches import FancyArrowPatch, FancyBboxPatch, Circle
 
 import streamlit as st
 import student_store as store   # per-student progress (safe no-op when unconfigured)
+from login_gate import require_login
 import autosave_worker as _autosave_worker   # saves progress off the click path
 
 try:
@@ -1161,17 +1162,13 @@ if st.query_params.get("diag"):
 # Require a student ID whenever this is a *managed* session — a Director game
 # link (?game=) or any deployment with storage enabled. A plain local run with
 # neither still skips the gate and behaves exactly as before.
+# Uses the shared sign-in screen (login_gate.py) that every Juicetification game uses.
 if (game or store.enabled()) and not sid:
-    st.title("🥤 Juicetification: The Lean Rush")
-    _entered = st.text_input("Enter your student ID to begin", key="_sid_gate")
-    if st.button("Start", type="primary") and _entered.strip():
-        store.set_student_id(_entered)
-        st.rerun()
     if game and not store.enabled():
         st.warning("Progress storage isn't detected on this deployment, so "
                    "progress won't be saved. Instructor: add the storage secrets "
                    "(open this page with `?diag=1` to check which are missing).")
-    st.stop()                     # don't build the lab until a student id exists
+    sid = require_login("The Lean Rush", "🥤", required=True)   # stops until signed in
 
 STATION_EMOJI = {"Cups": "🥤", "Fruit": "🍓", "Ice": "🧊",
                  "Blender": "🌀", "Finish": "🏷️", "Pickup": "🧍"}
